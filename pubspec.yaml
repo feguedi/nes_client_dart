@@ -1,0 +1,17 @@
+name: nes_client
+description: Dartlang port of (hapi)nes WebSocket Client.
+version: 0.0.1
+homepage: https://gudin.io
+repository: https://github.com/feguedi/nes_client_dart
+issue_tracker: https://github.com/feguedi/nes_client_dart/issues
+
+environment:
+  sdk: '>=2.14.3 <3.0.0'
+
+
+# dependencies:
+#   path: ^1.8.0
+
+dev_dependencies:
+  lints: ^1.0.0
+  test: ^1.16.0
