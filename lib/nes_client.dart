@@ -4,5 +4,6 @@
 library nes_client;
 
 export 'src/nes_client_base.dart';
+export 'src/nes_error.dart';
 
 // TODO: Export any libraries intended for clients of this package.
