@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as Math;
@@ -12,14 +13,15 @@ class Client {
 
   WebSocket? _ws;
   _Reconnection? _reconnection;
-  int? _reconnectionTimer;
+  Timer? _reconnectionTimer;
   int? _ids = 0;
   Map? _requests = {};
-  Map? _subscriptions = {};
+  Map<String, dynamic>? _subscriptions = {};
   int? _heartbeat;
   List? _packets = [];
-  bool? _disconnectListeners;
+  List? _disconnectListeners;
   bool? _disconnectRequested = false;
+  int version = 2;
 
   Client(this._url, {Map<String, dynamic>? settings}) {
     _settings = settings;
@@ -61,11 +63,10 @@ class Client {
         delay: options['delay'] ?? 1000,
         maxDelay: options['maxDelay'] ?? 5000,
         retries: options['retries'] ?? double.infinity,
-        settings: options['auth'] != null && options['timeout'] != null
-            ? _Settings(
-                timeout: options['timeout'],
-                auth: _Auth(options['auth']['headers']))
-            : null,
+        settings: _Settings(
+          timeout: options['timeout'],
+          auth: _Auth(options['auth']['headers']),
+        ),
       );
     } else {
       _reconnection = null;
@@ -88,15 +89,40 @@ class Client {
   onUpdate() => _ignore();
 
   _connect(Map<String, dynamic> options, bool initial, next) async {
-    WebSocket ws = await WebSocket.connect(_url);
+    WebSocket ws = await WebSocket.connect(_url,
+        protocols: _settings != null ? _settings!['ws'] : null);
     _ws = ws;
   }
 
-  reauthenticate() {}
+  reauthenticate(auth) {
+    overrideReconnectionAuth(auth);
+
+    final _SendRequest _request = _SendRequest(type: 'reauth', auth: auth);
+
+    return _send(_request, true);
+  }
+
   disconnect() {}
   _disconnect(Function next, isInternal) {
     _reconnection = null;
     _reconnectionTimer = null;
+    final requested = _disconnectRequested! || !isInternal;
+
+    if (_disconnectListeners != null) {
+      _disconnectRequested = requested;
+      _disconnectListeners!.add(next);
+      return;
+    }
+
+    if (_ws == null ||
+        (_ws!.readyState != WebSocket.open &&
+            _ws!.readyState != WebSocket.connecting)) {
+      return next();
+    }
+
+    _disconnectRequested = requested;
+    _disconnectListeners = [next];
+    _ws!.close();
   }
 
   _cleanup() {}
@@ -110,7 +136,7 @@ class Client {
       return _disconnect(_ignore, true);
     }
 
-    reconnection.retries -= 1;
+    reconnection.retries--;
     reconnection.wait = reconnection.wait + reconnection.delay;
 
     final timeout = Math.min(reconnection.wait, reconnection.maxDelay);
@@ -122,16 +148,123 @@ class Client {
     // }) as int?;
   }
 
-  request() {}
+  request({Map<String, dynamic>? options, String? path}) {
+    if (options == null && path != null) {
+      options = {
+        'method': 'GET',
+        'path': path,
+      };
+    } else if (options == null && path == null) {
+      return;
+    }
+
+    final _request = _SendRequest(
+        type: 'request',
+        method: options!['method'],
+        path: options['path'],
+        headers: options['headers'],
+        payload: options['payload']);
+
+    return _send(_request, true);
+  }
+
   message() {}
-  _isReady() {}
-  _send() {}
-  _hello() {}
-  subscriptions() {}
-  subscribe() {}
+  _isReady() {
+    return _ws != null && _ws!.readyState == WebSocket.open;
+  }
+
+  Future _send(_SendRequest request, bool track) {
+    if (!_isReady()) {
+      return Future.error(NesError(
+          'Failed to send message - server disconnected',
+          ErrorTypes.DISCONNECT));
+    }
+
+    _ids = _ids! + 1;
+    request.id = _ids;
+    String encoded;
+
+    try {
+      encoded = stringify(request)!;
+    } catch (e) {
+      return Future.error(e);
+    }
+
+    // Ignore errors
+    if (!track) {
+      try {
+        _ws!.add(encoded);
+        return Future(() => {});
+      } catch (e) {
+        return Future.error(e);
+      }
+    }
+
+    // Track errors
+    return Future(() => {});
+  }
+
+  _hello(auth) {
+    final _request = _SendRequest(type: 'hello', version: version);
+
+    if (auth != null) {
+      _request.auth = auth;
+    }
+
+    final subs = subscriptions();
+    if (subs.isNotEmpty) {
+      _request.subs = subs;
+    }
+
+    return _send(_request, true);
+  }
+
+  List<String> subscriptions() {
+    return _subscriptions != null ? _subscriptions!.keys.toList() : [];
+  }
+
+  subscribe(String? path, Function handler) {
+    if (path == null || path[0] != '/') {
+      return Future.error(NesError('Invalid path', ErrorTypes.USER));
+    }
+
+    final List? subs = _subscriptions![path];
+    if (subs != null) {
+      // Already subscribed
+      if (!subs.contains(handler)) {
+        subs.add(handler);
+      }
+      return;
+    }
+
+    _subscriptions![path] = [handler];
+
+    if (!_isReady()) {
+      // Queued subscription
+      return;
+    }
+
+    final _SendRequest _request = _SendRequest(type: 'sub', path: path);
+
+    final future = _send(_request, true);
+  }
+
   unsubscribe() {}
-  _onMessage() {}
+  _onMessage(message) {
+    _beat();
+
+    final data = message.data;
+  }
+
   _beat() {}
+
+  overrideReconnectionAuth(auth) {
+    if (_reconnection == null) {
+      return false;
+    }
+    _reconnection!.settings!.auth = auth;
+    return true;
+  }
 }
 
 class _Reconnection {
@@ -249,4 +382,63 @@ class _Headers {
   set authorization(String? newVal) {
     _authorization = newVal;
   }
+}
+
+class _SendRequest {
+  int? id;
+  String type;
+  String? method = 'GET';
+  _Auth? auth;
+  String? path;
+  _Headers? headers;
+  String? message;
+  String? payload;
+  int? version;
+  List<String>? subs;
+
+  _SendRequest({
+    required this.type,
+    this.method,
+    this.path,
+    this.id,
+    this.headers,
+    this.payload,
+    this.message,
+    this.auth,
+    this.subs,
+    this.version,
+  });
+
+  @override
+  String toString() => toJson();
+
+  factory _SendRequest.fromJson(String str) =>
+      _SendRequest.fromMap(json.decode(str));
+
+  factory _SendRequest.fromMap(Map<String, dynamic> json) => _SendRequest(
+        type: json['type'],
+        id: json['id'],
+        method: json['method'],
+        auth: json['auth'],
+        path: json['path'],
+        headers: json['headers'],
+        message: json['message'],
+        payload: json['payload'],
+        version: json['version'],
+        subs: json['subs'],
+      );
+
+  String toJson() => json.encode(toMap());
+  Map<String, dynamic> toMap() => {
+        'type': type,
+        'id': id,
+        'method': method,
+        'auth': auth,
+        'path': path,
+        'headers': headers,
+        'message': message,
+        'payload': payload,
+        'version': version,
+        'subs': subs,
+      };
 }
