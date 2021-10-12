@@ -1,15 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as Math;
+import 'dart:math' as math;
 
 import './nes_error.dart';
 
 class Client {
   final String _url;
-  Map? _settings;
+  Map<String, dynamic>? _settings;
 
-  bool _heartbeatTimeout = false;
+  int? _heartbeatTimeout;
 
   WebSocket? _ws;
   _Reconnection? _reconnection;
@@ -17,10 +17,11 @@ class Client {
   int? _ids = 0;
   Map? _requests = {};
   Map<String, dynamic>? _subscriptions = {};
-  int? _heartbeat;
+  Timer? _heartbeat;
   List? _packets = [];
-  List? _disconnectListeners;
+  List<Function>? _disconnectListeners;
   bool? _disconnectRequested = false;
+  int? id;
   int version = 2;
 
   Client(this._url, {Map<String, dynamic>? settings}) {
@@ -88,13 +89,40 @@ class Client {
   onHeartbeatTimeout() => _ignore();
   onUpdate() => _ignore();
 
-  _connect(Map<String, dynamic> options, bool initial, next) async {
+  void _connect(
+      Map<String, dynamic> options, bool initial, Function? next) async {
     WebSocket ws = await WebSocket.connect(_url,
         protocols: _settings != null ? _settings!['ws'] : null);
     _ws = ws;
+
+    _reconnectionTimer!.cancel();
+    _reconnectionTimer = null;
+
+    finalize(NesError err) {
+      if (next != null) {
+        final nextHolder = next!;
+        next = null;
+        return nextHolder(err);
+      }
+
+      return onError(err);
+    }
+
+    timeoutHandler() {
+      _cleanup();
+      finalize(NesError('Connection timed out', ErrorTypes.TIMEOUT));
+
+      if (initial) {
+        return _reconnect();
+      }
+    }
+
+    final Timer? timeout = options['timeout'] != null
+        ? Timer(Duration(seconds: options['timeout']), timeoutHandler)
+        : null;
   }
 
-  reauthenticate(auth) {
+  reauthenticate(_Auth auth) {
     overrideReconnectionAuth(auth);
 
     final _SendRequest _request = _SendRequest(type: 'reauth', auth: auth);
@@ -103,8 +131,10 @@ class Client {
   }
 
   disconnect() {}
+
   _disconnect(Function next, isInternal) {
     _reconnection = null;
+    _reconnectionTimer!.cancel();
     _reconnectionTimer = null;
     final requested = _disconnectRequested! || !isInternal;
 
@@ -125,7 +155,47 @@ class Client {
     _ws!.close();
   }
 
-  _cleanup() {}
+  _cleanup() {
+    if (_ws != null) {
+      WebSocket ws = _ws!;
+      _ws = null;
+
+      if (ws.readyState != WebSocket.closed &&
+          ws.readyState != WebSocket.closing) {
+        ws.close();
+      }
+    }
+
+    _packets = [];
+    id = null;
+
+    _heartbeat!.cancel();
+    _heartbeat = null;
+
+    // Flush pending requests
+    NesError error =
+        NesError('Request failed - server disconnected', ErrorTypes.DISCONNECT);
+
+    final requests = _requests;
+    _requests = {};
+    final ids = requests!.keys;
+
+    for (var id in ids) {
+      final request = requests[id];
+      request['timeout'].cancel();
+      request['reject'](error);
+    }
+
+    if (_disconnectListeners != null) {
+      final List<Function> listeners = _disconnectListeners!;
+      _disconnectListeners = null;
+      _disconnectRequested = false;
+      for (Function element in listeners) {
+        element();
+      }
+    }
+  }
+
   _reconnect() {
     final reconnection = _reconnection;
     if (reconnection == null) {
@@ -139,13 +209,20 @@ class Client {
     reconnection.retries--;
     reconnection.wait = reconnection.wait + reconnection.delay;
 
-    final timeout = Math.min(reconnection.wait, reconnection.maxDelay);
+    final timeout = math.min(reconnection.wait, reconnection.maxDelay);
 
-    // _reconnectionTimer = Future.delayed(Duration(milliseconds: timeout), () => {
-    //   _connect(reconnection.settings!.toMap(), false, (err) => {
+    _reconnectionTimer = Timer(Duration(seconds: timeout), () {
+      _connect(reconnection.settings!.toMap(), false, (err) {
+        if (err) {
+          onError(err);
+          return _reconnect();
+        }
+      });
+    });
+  }
 
-    //   })
-    // }) as int?;
+  bool _willReconnect() {
+    return _reconnection != null && _reconnection!.retries >= 1;
   }
 
   request({Map<String, dynamic>? options, String? path}) {
@@ -194,14 +271,30 @@ class Client {
     if (!track) {
       try {
         _ws!.add(encoded);
-        return Future(() => {});
+        return Future.value();
       } catch (e) {
         return Future.error(e);
       }
     }
 
+    final record = _Record();
+
     // Track errors
-    return Future(() => {});
+    if (_settings!['timeout'] != null) {
+      record.timeout = Timer(Duration(seconds: _settings!['timeout']), () {
+        record.timeout = null;
+        return;
+      });
+    }
+
+    try {
+      _ws!.add(encoded);
+    } catch (e) {
+      _requests!.remove(request.id);
+      return Future.error(NesError(e, ErrorTypes.WS));
+    }
+
+    return Future(() {});
   }
 
   _hello(auth) {
@@ -247,18 +340,69 @@ class Client {
     final _SendRequest _request = _SendRequest(type: 'sub', path: path);
 
     final future = _send(_request, true);
+
+    future.catchError((ignoreError) {
+      _subscriptions!.remove(path);
+    });
+
+    return future;
   }
 
-  unsubscribe() {}
+  Future unsubscribe(String? path, Function? handler) {
+    if (path == null || path[0] != '/') {
+      return Future.error(NesError('Invalid path', ErrorTypes.USER));
+    }
+
+    List? subs = _subscriptions![path];
+    if (subs == null) {
+      return Future.value();
+    }
+
+    bool _sync = false;
+    if (handler == null) {
+      _subscriptions!.remove(path);
+      _sync = true;
+    } else {
+      final int pos = subs.indexOf(handler);
+      if (pos == -1) {
+        return Future.value();
+      }
+
+      subs.removeAt(pos);
+      if (subs.isEmpty) {
+        _subscriptions!.remove(path);
+        _sync = true;
+      }
+    }
+
+    final request = _SendRequest(type: 'unsub', path: path);
+    final future = _send(request, true);
+    future.catchError((e) => print(e));
+
+    return future;
+  }
+
   _onMessage(message) {
     _beat();
 
     final data = message.data;
   }
 
-  _beat() {}
+  _beat() {
+    if (_heartbeatTimeout == null) {
+      return;
+    }
 
-  overrideReconnectionAuth(auth) {
+    _heartbeat!.cancel();
+    _heartbeat = Timer(Duration(seconds: _heartbeatTimeout!), () {
+      onError(NesError(
+          'Disconnecting due to heartbeat timeout', ErrorTypes.TIMEOUT));
+      onHeartbeatTimeout();
+      _ws!.close();
+    });
+  }
+
+  bool overrideReconnectionAuth(_Auth auth) {
     if (_reconnection == null) {
       return false;
     }
@@ -441,4 +585,12 @@ class _SendRequest {
         'version': version,
         'subs': subs,
       };
+}
+
+class _Record {
+  Function? resolve;
+  Function? reject;
+  Timer? timeout;
+
+  _Record({this.resolve, this.reject, this.timeout});
 }
