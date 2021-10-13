@@ -667,7 +667,8 @@ class _Settings {
         maxPayload: json['maxPayload'],
         timeout: json['timeout'],
         protocols: json['protocols'],
-        headers: _Headers.fromMap(json['headers']),
+        headers:
+            json['headers'] != null ? _Headers.fromJson(json['headers']) : null,
       );
   factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
 

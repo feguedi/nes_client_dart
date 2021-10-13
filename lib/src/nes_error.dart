@@ -26,6 +26,11 @@ Map<int, String> errorCodes = {
 class _NesException implements Exception {
   String cause;
   _NesException(this.cause);
+
+  @override
+  String toString() {
+    return 'NesException: $cause';
+  }
 }
 
 class _NesError extends Error {
@@ -45,10 +50,8 @@ class _NesError extends Error {
 
   @override
   String toString() {
-    final message = '';
-    return '''Error:
-    $message
-    ''';
+    final message = _type.toString().replaceAll('ErrorTypes.', '');
+    return 'NesError: $message';
   }
 }
 
@@ -58,7 +61,8 @@ class NesError {
 
   NesError(err, this.type) {
     if (err is String) {
-      throw _throwException('${type.toString()}: $err');
+      final String _type = type.toString().replaceAll('ErrorTypes.', '');
+      throw _throwException('$_type: $err');
     } else if (err is Object) {
       _nesError.type = type;
       _nesError.isNes = true;
