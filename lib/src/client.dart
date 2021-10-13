@@ -7,7 +7,7 @@ import './nes_error.dart';
 
 class Client {
   final String _url;
-  Map<String, dynamic>? _settings;
+  _Settings? _settings;
 
   int? _heartbeatTimeout;
 
@@ -25,10 +25,8 @@ class Client {
   int version = 2;
 
   Client(this._url, {Map<String, dynamic>? settings}) {
-    _settings = settings;
-    _settings ??= {};
-    _settings!['ws'] = _settings!['ws'] ?? {};
-    _settings!['ws']['maxPayload'] = _settings!['ws']['maxPayload'] ?? 0;
+    _settings = _Settings.fromMap(settings ?? {});
+    _settings!.maxPayload = _settings!.maxPayload ?? 0;
   }
 
   _ignore() {}
@@ -45,8 +43,23 @@ class Client {
     return (err) => {Future.delayed(Duration(seconds: 0), callback(err))};
   }
 
-  connect(Map<String, dynamic>? options) {
-    options ??= {};
+  // connect(Map<String, dynamic>? options) {
+  connect({
+    bool? reconnect,
+    int? timeout,
+    int? delay,
+    int? maxDelay,
+    double? retries,
+    Map<String, String>? headers,
+  }) {
+    final _ConnectOptions _connectOptions = _ConnectOptions(
+      reconnect: reconnect,
+      timeout: timeout,
+      delay: delay,
+      maxDelay: maxDelay,
+      retries: retries,
+      headers: headers != null ? _Headers.fromMap(headers) : null,
+    );
     if (_reconnection != null) {
       return Future.error(
         NesError('Cannot connect while client attempts to reconnect',
@@ -58,15 +71,15 @@ class Client {
       return Future.error(NesError('Already connected', ErrorTypes.USER));
     }
 
-    if (options['reconnect'] != false) {
+    if (reconnect != false) {
       _reconnection = _Reconnection(
         wait: 0,
-        delay: options['delay'] ?? 1000,
-        maxDelay: options['maxDelay'] ?? 5000,
-        retries: options['retries'] ?? double.infinity,
-        settings: _Settings(
-          timeout: options['timeout'],
-          auth: _Auth(options['auth']['headers']),
+        delay: delay ?? 1000,
+        maxDelay: maxDelay ?? 5000,
+        retries: retries ?? double.infinity,
+        settings: _HeadersSettings(
+          timeout: timeout,
+          auth: _Auth(headers != null ? _Headers.fromMap(headers) : null),
         ),
       );
     } else {
@@ -74,7 +87,7 @@ class Client {
     }
 
     return Future.microtask(() {
-      _connect(options!, true, (err) {
+      _connect(_connectOptions, true, (err) {
         if (err) {
           return Future.error(err);
         }
@@ -90,14 +103,15 @@ class Client {
   onHeartbeatTimeout() => _ignore();
   onUpdate() => _ignore();
 
-  void _connect(
-      Map<String, dynamic> options, bool initial, Function? next) async {
+  void _connect(_ConnectOptions options, bool initial, Function? next) async {
     WebSocket ws = await WebSocket.connect(_url,
-        protocols: _settings != null ? _settings!['ws'] : null);
+        protocols: _settings != null ? _settings!.protocols : null);
     _ws = ws;
 
-    _reconnectionTimer!.cancel();
-    _reconnectionTimer = null;
+    if (_reconnectionTimer != null) {
+      _reconnectionTimer!.cancel();
+      _reconnectionTimer = null;
+    }
 
     finalize(NesError err) {
       if (next != null) {
@@ -118,8 +132,8 @@ class Client {
       }
     }
 
-    final Timer? timeout = options['timeout'] != null
-        ? Timer(Duration(seconds: options['timeout']), timeoutHandler)
+    final Timer? timeout = options.timeout != null
+        ? Timer(Duration(seconds: options.timeout!), timeoutHandler)
         : null;
   }
 
@@ -207,6 +221,15 @@ class Client {
       return;
     }
 
+    final _connectOptions = _ConnectOptions(
+      reconnect: true,
+      timeout: reconnection.settings?.timeout,
+      delay: reconnection.delay,
+      maxDelay: reconnection.maxDelay,
+      retries: reconnection.retries,
+      headers: reconnection.settings?.auth?.headers,
+    );
+
     if (reconnection.retries < 1) {
       return _disconnect(_ignore, true);
     }
@@ -217,7 +240,7 @@ class Client {
     final timeout = math.min(reconnection.wait, reconnection.maxDelay);
 
     _reconnectionTimer = Timer(Duration(seconds: timeout), () {
-      _connect(reconnection.settings!.toMap(), false, (err) {
+      _connect(_connectOptions, false, (err) {
         if (err) {
           onError(err);
           return _reconnect();
@@ -285,8 +308,8 @@ class Client {
     final record = _Record();
 
     // Track errors
-    if (_settings!['timeout'] != null) {
-      record.timeout = Timer(Duration(seconds: _settings!['timeout']), () {
+    if (_settings!.timeout != null) {
+      record.timeout = Timer(Duration(seconds: _settings!.timeout ?? 5), () {
         record.timeout = null;
         return;
       });
@@ -421,14 +444,14 @@ class _Reconnection {
   late int _delay;
   late int _maxDelay;
   late double _retries;
-  _Settings? _settings;
+  _HeadersSettings? _settings;
 
   _Reconnection(
       {required int wait,
       required int delay,
       required int maxDelay,
       required double retries,
-      _Settings? settings}) {
+      _HeadersSettings? settings}) {
     _wait = wait;
     _delay = delay;
     _maxDelay = maxDelay;
@@ -440,7 +463,7 @@ class _Reconnection {
   int get delay => _delay;
   int get maxDelay => _maxDelay;
   double get retries => _retries;
-  _Settings? get settings => _settings;
+  _HeadersSettings? get settings => _settings;
 
   set wait(int newVal) {
     _wait = newVal;
@@ -458,24 +481,26 @@ class _Reconnection {
     _retries = newVal;
   }
 
-  set settings(_Settings? newVal) {
+  set settings(_HeadersSettings? newVal) {
     _settings = newVal;
   }
 }
 
-class _Settings {
+class _HeadersSettings {
   int? _timeout;
   _Auth? _auth;
 
-  _Settings({int? timeout, _Auth? auth}) {
+  _HeadersSettings({int? timeout, _Auth? auth}) {
     _auth = auth;
     _timeout = timeout;
   }
 
-  factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
+  factory _HeadersSettings.fromJson(String str) =>
+      _HeadersSettings.fromMap(json.decode(str));
   String toJson() => json.encode(toMap());
 
-  factory _Settings.fromMap(Map<String, dynamic> json) => _Settings(
+  factory _HeadersSettings.fromMap(Map<String, dynamic> json) =>
+      _HeadersSettings(
         auth: _Auth.fromMap(json['auth']),
         timeout: json['timeout'],
       );
@@ -598,4 +623,44 @@ class _Record {
   Timer? timeout;
 
   _Record({this.resolve, this.reject, this.timeout});
+}
+
+class _ConnectOptions {
+  bool? reconnect;
+  int? timeout;
+  int? delay;
+  int? maxDelay;
+  double? retries;
+  _Headers? headers;
+
+  _ConnectOptions({
+    this.reconnect,
+    this.timeout,
+    this.delay,
+    this.maxDelay,
+    this.retries,
+    this.headers,
+  });
+}
+
+class _Settings {
+  int? maxPayload;
+  Iterable<String>? protocols;
+  int? timeout;
+
+  _Settings({this.maxPayload, this.protocols, this.timeout});
+
+  factory _Settings.fromMap(Map<String, dynamic> json) => _Settings(
+        maxPayload: json['maxPayload'],
+        timeout: json['timeout'],
+        protocols: json['protocols'],
+      );
+  factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() => {
+        'maxPayload': maxPayload,
+        'protocols': protocols,
+        'timeout': timeout,
+      };
+  String toJson() => json.encode(toMap());
 }
