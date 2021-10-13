@@ -540,21 +540,33 @@ class _Auth {
 }
 
 class _Headers {
+  String? _cookie;
   String? _authorization;
-  _Headers(this._authorization);
+  _Headers({String? authorization, String? cookie}) {
+    _cookie = cookie;
+    _authorization = authorization;
+  }
 
   factory _Headers.fromJson(String str) => _Headers.fromMap(json.decode(str));
   String toJson() => json.encode(toMap());
 
-  factory _Headers.fromMap(Map<String, dynamic> json) =>
-      _Headers(json['Authorization']);
+  factory _Headers.fromMap(Map<String, dynamic> json) => _Headers(
+        authorization: json['authorization'] ?? json['Authorization'],
+        cookie: json['cookie'] ?? json['Cookie'],
+      );
   Map<String, dynamic> toMap() => {
         'Authorization': _authorization,
+        'Cookie': _cookie,
       };
 
   String? get authorization => _authorization;
   set authorization(String? newVal) {
     _authorization = newVal;
+  }
+
+  String? get cookie => _cookie;
+  set cookie(String? newVal) {
+    _cookie = newVal;
   }
 }
 
@@ -647,13 +659,15 @@ class _Settings {
   int? maxPayload;
   Iterable<String>? protocols;
   int? timeout;
+  _Headers? headers;
 
-  _Settings({this.maxPayload, this.protocols, this.timeout});
+  _Settings({this.maxPayload, this.protocols, this.timeout, this.headers});
 
   factory _Settings.fromMap(Map<String, dynamic> json) => _Settings(
         maxPayload: json['maxPayload'],
         timeout: json['timeout'],
         protocols: json['protocols'],
+        headers: _Headers.fromMap(json['headers']),
       );
   factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
 
@@ -661,6 +675,7 @@ class _Settings {
         'maxPayload': maxPayload,
         'protocols': protocols,
         'timeout': timeout,
+        'headers': headers,
       };
   String toJson() => json.encode(toMap());
 }
