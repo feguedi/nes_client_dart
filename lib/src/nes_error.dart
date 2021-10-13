@@ -7,6 +7,22 @@ enum ErrorTypes {
   USER,
 }
 
+Map<int, String> errorCodes = {
+  1000: 'Normal closure',
+  1001: 'Going away',
+  1002: 'Protocol error',
+  1003: 'Unsupported data',
+  1004: 'Reserved',
+  1005: 'No status received',
+  1006: 'Abnormal closure',
+  1007: 'Invalid frame payload data',
+  1008: 'Policy violation',
+  1009: 'Message too big',
+  1010: 'Mandatory extension',
+  1011: 'Internal server error',
+  1015: 'TLS handshake',
+};
+
 class _NesException implements Exception {
   String cause;
   _NesException(this.cause);
@@ -37,28 +53,12 @@ class _NesError extends Error {
 }
 
 class NesError {
-  final Map<int, String> errorCodes = {
-    1000: 'Normal closure',
-    1001: 'Going away',
-    1002: 'Protocol error',
-    1003: 'Unsupported data',
-    1004: 'Reserved',
-    1005: 'No status received',
-    1006: 'Abnormal closure',
-    1007: 'Invalid frame payload data',
-    1008: 'Policy violation',
-    1009: 'Message too big',
-    1010: 'Mandatory extension',
-    1011: 'Internal server error',
-    1015: 'TLS handshake',
-  };
-
   final ErrorTypes type;
   final _NesError _nesError = _NesError();
 
   NesError(err, this.type) {
     if (err is String) {
-      throw _throwException(err);
+      throw _throwException('${type.toString()}: $err');
     } else if (err is Object) {
       _nesError.type = type;
       _nesError.isNes = true;

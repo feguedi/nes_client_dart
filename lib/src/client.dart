@@ -73,14 +73,15 @@ class Client {
       _reconnection = null;
     }
 
-    return Future(() => {
-          _connect(
-              options!,
-              true,
-              (err) => {
-                    if (err) {Future.error(err)}
-                  })
-        });
+    return Future.microtask(() {
+      _connect(options!, true, (err) {
+        if (err) {
+          return Future.error(err);
+        }
+
+        return Future.value();
+      });
+    });
   }
 
   onError(err) => print(err);
@@ -130,7 +131,11 @@ class Client {
     return _send(_request, true);
   }
 
-  disconnect() {}
+  disconnect() {
+    return Future.microtask(() {
+      _disconnect(() {}, false);
+    });
+  }
 
   _disconnect(Function next, isInternal) {
     _reconnection = null;
