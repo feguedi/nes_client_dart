@@ -61,8 +61,9 @@ class NesError {
 
   NesError(err, this.type) {
     if (err is String) {
-      final String _type = type.toString().replaceAll('ErrorTypes.', '');
-      throw _throwException('$_type: $err');
+      final String errorTypeString =
+          type.toString().replaceAll('ErrorTypes.', '');
+      throw _throwException('$errorTypeString: $err');
     } else if (err is Object) {
       _nesError.type = type;
       _nesError.isNes = true;

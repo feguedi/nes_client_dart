@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection' show HashMap;
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -15,8 +16,8 @@ class Client {
   _Reconnection? _reconnection;
   Timer? _reconnectionTimer;
   int? _ids = 0;
-  Map? _requests = {};
-  Map<String, dynamic>? _subscriptions = {};
+  HashMap<String, dynamic>? _requests = HashMap.from({});
+  HashMap<String, dynamic>? _subscriptions = HashMap.from({});
   Timer? _heartbeat;
   List? _packets = [];
   List<Function>? _disconnectListeners;
@@ -26,7 +27,7 @@ class Client {
 
   Client(this._url, {Map<String, dynamic>? settings}) {
     _settings = _Settings.fromMap(settings ?? {});
-    _settings!.maxPayload = _settings!.maxPayload ?? 0;
+    _settings?.maxPayload = _settings?.maxPayload ?? 0;
   }
 
   _ignore() {}
@@ -50,7 +51,7 @@ class Client {
     int? delay,
     int? maxDelay,
     double? retries,
-    Map<String, String>? headers,
+    Map<String, Map<String, String>>? auth,
   }) {
     final _ConnectOptions _connectOptions = _ConnectOptions(
       reconnect: reconnect,
@@ -58,7 +59,7 @@ class Client {
       delay: delay,
       maxDelay: maxDelay,
       retries: retries,
-      headers: headers != null ? _Headers.fromMap(headers) : null,
+      auth: _Auth(_Headers.fromMap(auth ?? {})),
     );
     if (_reconnection != null) {
       return Future.error(
@@ -79,7 +80,7 @@ class Client {
         retries: retries ?? double.infinity,
         settings: _HeadersSettings(
           timeout: timeout,
-          auth: _Auth(headers != null ? _Headers.fromMap(headers) : null),
+          auth: _Auth(auth != null ? _Headers.fromMap(auth) : null),
         ),
       );
     } else {
@@ -101,7 +102,7 @@ class Client {
   onConnect() => _ignore();
   onDisconnect() => _ignore();
   onHeartbeatTimeout() => _ignore();
-  onUpdate() => _ignore();
+  onUpdate(_) => _ignore();
 
   void _connect(_ConnectOptions options, bool initial, Function? next) async {
     WebSocket ws = await WebSocket.connect(_url,
@@ -196,7 +197,7 @@ class Client {
         NesError('Request failed - server disconnected', ErrorTypes.DISCONNECT);
 
     final requests = _requests;
-    _requests = {};
+    _requests!.clear();
     final ids = requests!.keys;
 
     for (var id in ids) {
@@ -227,7 +228,7 @@ class Client {
       delay: reconnection.delay,
       maxDelay: reconnection.maxDelay,
       retries: reconnection.retries,
-      headers: reconnection.settings?.auth?.headers,
+      auth: reconnection.settings?._auth,
     );
 
     if (reconnection.retries < 1) {
@@ -305,24 +306,37 @@ class Client {
       }
     }
 
-    final record = _Record();
+    final record = _Request(
+      reject: (NesError reason) {
+        return Future.error(reason);
+      },
+      resolve: (value) {
+        return Future.value(value);
+      },
+    );
+
+    final future = Future(() {});
 
     // Track errors
     if (_settings!.timeout != null) {
       record.timeout = Timer(Duration(seconds: _settings!.timeout ?? 5), () {
         record.timeout = null;
-        return;
+        return record
+            .reject!(NesError('Request timed out', ErrorTypes.TIMEOUT));
       });
     }
+
+    _requests![request.id.toString()] = record;
 
     try {
       _ws!.add(encoded);
     } catch (e) {
-      _requests!.remove(request.id);
+      _requests![request.id.toString()].timeout?.cancel();
+      _requests!.remove(request.id.toString());
       return Future.error(NesError(e, ErrorTypes.WS));
     }
 
-    return Future(() {});
+    return future;
   }
 
   _hello(auth) {
@@ -410,10 +424,99 @@ class Client {
     return future;
   }
 
-  _onMessage(message) {
+  _onMessage(_Message message) {
     _beat();
 
-    final data = message.data;
+    _UpdateData? update;
+    String data = message.data;
+    // String? dataString = _packets == null ? data.toString() : _packets!.join('');
+    final String prefix = data[0];
+    if (prefix != '{' && _packets != null) {
+      _packets!.add(data.substring(1));
+      if (prefix != '!') {
+        return;
+      }
+
+      data = _packets!.join('');
+      _packets = [];
+    }
+
+    if (_packets!.isNotEmpty) {
+      onError(NesError('Received an incomplete message', ErrorTypes.PROTOCOL));
+    }
+
+    try {
+      update = _UpdateData.fromJson(data);
+    } catch (e) {
+      return onError(NesError(e, ErrorTypes.PROTOCOL));
+    }
+
+    // Recreate error
+
+    NesError? error = null;
+
+    if (update.statusCode != null && update.statusCode! >= 400) {
+      error = update.payload != null &&
+              (update.payload!.message != null || update.payload!.error != null)
+          ? NesError(update.payload!.message ?? update.payload!.error,
+              ErrorTypes.SERVER)
+          : NesError('Error', ErrorTypes.SERVER);
+    }
+
+    // Ping
+
+    if (update.type == 'ping') {
+      return _send(_SendRequest(type: 'ping'), false).catchError(_ignore);
+    }
+
+    // Broadcast and update
+
+    if (update.type == 'update') {
+      return onUpdate(update.message);
+    }
+
+    // Publish or revoke
+
+    if ((update.type == 'pub' || update.type == 'revoke') &&
+        update.path != null) {
+      final List<Function>? handlers =
+          update.path == null ? null : _subscriptions![update.path ?? ''];
+      if (update.type == 'revoke') {
+        _subscriptions!.remove(update.path);
+      }
+
+      if (handlers != null && update.message != null) {
+        final Map<String, dynamic> flags = {};
+        if (update.type == 'revoke') {
+          flags['revoked'] = true;
+        }
+
+        for (Function handler in handlers) {
+          handler(update.message, flags);
+        }
+      }
+
+      return;
+    }
+
+    // Lookup request (message must include an id from this point)
+
+    final _Request? request = _requests![update.id];
+    if (request == null) {
+      return onError(NesError(
+          'Received response for unknown request', ErrorTypes.PROTOCOL));
+    }
+
+    if (request.timeout != null) {
+      request.timeout!.cancel();
+    }
+    _requests!.remove(update.id);
+
+    next(err, args) {
+      if (err != null) {
+        return request.reject!(err);
+      }
+    }
   }
 
   _beat() {
@@ -629,12 +732,12 @@ class _SendRequest {
       };
 }
 
-class _Record {
+class _Request {
   Function? resolve;
   Function? reject;
   Timer? timeout;
 
-  _Record({this.resolve, this.reject, this.timeout});
+  _Request({this.resolve, this.reject, this.timeout});
 }
 
 class _ConnectOptions {
@@ -643,7 +746,7 @@ class _ConnectOptions {
   int? delay;
   int? maxDelay;
   double? retries;
-  _Headers? headers;
+  _Auth? auth;
 
   _ConnectOptions({
     this.reconnect,
@@ -651,8 +754,32 @@ class _ConnectOptions {
     this.delay,
     this.maxDelay,
     this.retries,
-    this.headers,
+    this.auth,
   });
+
+  factory _ConnectOptions.fromMap(Map<String, dynamic> _json) =>
+      _ConnectOptions(
+        reconnect: _json['reconnect'],
+        timeout: _json['timeout'],
+        delay: _json['delay'],
+        maxDelay: _json['maxDelay'],
+        retries: _json['retries'],
+        auth: _Auth.fromJson(_json['auth']),
+      );
+
+  factory _ConnectOptions.fromJson(String str) =>
+      _ConnectOptions.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() => {
+        'reconnect': reconnect,
+        'timeout': timeout,
+        'delay': delay,
+        'maxDelay': maxDelay,
+        'retries': retries,
+        'auth': auth?.toMap(),
+      };
+
+  String toJson() => json.encode(toMap());
 }
 
 class _Settings {
@@ -676,7 +803,91 @@ class _Settings {
         'maxPayload': maxPayload,
         'protocols': protocols,
         'timeout': timeout,
-        'headers': headers,
+        'headers': headers == null ? {} : headers!.toMap(),
       };
   String toJson() => json.encode(toMap());
+}
+
+class _Message {
+  final String data;
+
+  _Message(this.data);
+}
+
+class _UpdateData {
+  String type;
+  String? id;
+  String? path;
+  _Payload? payload;
+  int? statusCode;
+  String? socket;
+  _Headers? headers;
+  String? message;
+  _HeartbeatTimes? heartbeat;
+
+  _UpdateData({
+    required this.type,
+    this.id,
+    this.path,
+    this.statusCode,
+    this.payload,
+    this.socket,
+    this.headers,
+    this.message,
+    this.heartbeat,
+  });
+
+  factory _UpdateData.fromMap(Map<String, dynamic> _json) => _UpdateData(
+        type: _json['type'],
+        id: _json['id'],
+        path: _json['path'],
+        statusCode: _json['statusCode'],
+        payload: _json['payload'],
+        socket: _json['socket'],
+        headers: _json['headers'],
+        message: _json['message'],
+        heartbeat: _json['heartbeat'],
+        // type: _json['type'],
+      );
+  factory _UpdateData.fromJson(String str) =>
+      _UpdateData.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() => {
+        'type': type,
+        'id': id,
+        'path': path,
+        'statusCode': statusCode,
+        'payload': payload,
+        'socket': socket,
+        'headers': headers,
+        'message': message,
+        'heartbeat': heartbeat,
+      };
+  String toJson() => json.encode(toMap());
+}
+
+class _Payload {
+  String? message;
+  String? error;
+
+  _Payload({this.message, this.error});
+
+  factory _Payload.fromMap(Map<String, dynamic> json) => _Payload(
+        message: json['message'],
+        error: json['error'],
+      );
+  factory _Payload.fromJson(String str) => _Payload.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() => {
+        'message': message,
+        'error': error,
+      };
+
+  String toJson() => json.encode(toMap());
+}
+
+class _HeartbeatTimes {
+  int? timeout;
+  int? interval;
+  _HeartbeatTimes({this.timeout, this.interval});
 }
