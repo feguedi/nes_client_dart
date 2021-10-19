@@ -53,13 +53,36 @@ class Client {
     double? retries,
     Map<String, Map<String, String>>? auth,
   }) {
+    final Map<String, String>? _headers = auth != null &&
+            auth.containsKey('headers') &&
+            (auth['headers']!.containsKey('authorization') ||
+                auth['headers']!.containsKey('Authorization') ||
+                auth['headers']!.containsKey('cookie') ||
+                auth['headers']!.containsKey('Cookie'))
+        ? auth['headers']
+        : null;
     final _ConnectOptions _connectOptions = _ConnectOptions(
       reconnect: reconnect,
       timeout: timeout,
       delay: delay,
       maxDelay: maxDelay,
       retries: retries,
-      auth: _Auth(_Headers.fromMap(auth ?? {})),
+      auth: _headers != null
+          ? _Auth.fromMap({
+              'headers': {
+                'authorization': _headers.containsKey('authorization')
+                    ? _headers['authorization']
+                    : _headers.containsKey('Authorization')
+                        ? _headers['Authorization']
+                        : null,
+                'cookie': _headers.containsKey('cookie')
+                    ? _headers['cookie']
+                    : _headers.containsKey('Cookie')
+                        ? _headers['Cookie']
+                        : null,
+              },
+            })
+          : null,
     );
     if (_reconnection != null) {
       return Future.error(
@@ -80,7 +103,22 @@ class Client {
         retries: retries ?? double.infinity,
         settings: _HeadersSettings(
           timeout: timeout,
-          auth: _Auth(auth != null ? _Headers.fromMap(auth) : null),
+          auth: _headers != null
+              ? _Auth.fromMap({
+                  'headers': {
+                    'authorization': _headers.containsKey('authorization')
+                        ? _headers['authorization']
+                        : _headers.containsKey('Authorization')
+                            ? _headers['Authorization']
+                            : null,
+                    'cookie': _headers.containsKey('cookie')
+                        ? _headers['cookie']
+                        : _headers.containsKey('Cookie')
+                            ? _headers['Cookie']
+                            : null,
+                  },
+                })
+              : null,
         ),
       );
     } else {
@@ -89,7 +127,7 @@ class Client {
 
     return Future.microtask(() {
       _connect(_connectOptions, true, (err) {
-        if (err) {
+        if (err != null) {
           return Future.error(err);
         }
 
@@ -100,21 +138,18 @@ class Client {
 
   onError(err) => print(err);
   onConnect() => _ignore();
-  onDisconnect() => _ignore();
+  onDisconnect(_, __) => _ignore();
   onHeartbeatTimeout() => _ignore();
   onUpdate(_) => _ignore();
 
   void _connect(_ConnectOptions options, bool initial, Function? next) async {
-    WebSocket ws = await WebSocket.connect(_url,
-        protocols: _settings != null ? _settings!.protocols : null);
+    WebSocket ws = await WebSocket.connect(
+      _url,
+      protocols: _settings != null ? _settings!.protocols : null,
+    );
     _ws = ws;
 
-    if (_reconnectionTimer != null) {
-      _reconnectionTimer!.cancel();
-      _reconnectionTimer = null;
-    }
-
-    finalize(NesError err) {
+    finalize(NesError? err) {
       if (next != null) {
         final nextHolder = next!;
         next = null;
@@ -122,6 +157,20 @@ class Client {
       }
 
       return onError(err);
+    }
+
+    reconnect(_Event event) {
+      if (ws.readyState == WebSocket.open) {
+        finalize(NesError(
+            'Connection terminated while waiting to connect', ErrorTypes.WS));
+      }
+
+      final wasRequested = _disconnectRequested;
+
+      _cleanup();
+
+      onDisconnect(event.willReconnect, event);
+      _reconnect();
     }
 
     timeoutHandler() {
@@ -136,6 +185,51 @@ class Client {
     final Timer? timeout = options.timeout != null
         ? Timer(Duration(seconds: options.timeout!), timeoutHandler)
         : null;
+
+    if (_reconnectionTimer != null) {
+      _reconnectionTimer!.cancel();
+      _reconnectionTimer = null;
+    }
+
+    if (_ws?.readyState == WebSocket.open) {
+      _reconnectionTimer?.cancel();
+
+      _hello(options.auth)
+        ..then((res) {
+          onConnect();
+          finalize(null);
+        })
+        ..catchError((err) {
+          if (err.path != null) {
+            _subscriptions?.remove(err.path);
+          }
+          _disconnect(() => nextTick(finalize)(err), true);
+        });
+
+      _ws?.listen(
+        (event) {
+          print('event: $event');
+          Timer(Duration(seconds: _reconnection?.wait ?? 1), () {
+            if (_ws?.readyState == WebSocket.open) {
+              return _onMessage(event);
+            }
+          });
+        },
+        onDone: () => print('[+] Done'),
+        onError: (err) => onError(err),
+        cancelOnError: true,
+      );
+    }
+
+    _ws?.handleError((event) {
+      timeout?.cancel();
+      if (_willReconnect()) {
+        return reconnect(event.toMap());
+      }
+
+      _cleanup();
+      return finalize(NesError('Socket error', ErrorTypes.WS));
+    });
   }
 
   reauthenticate(_Auth auth) {
@@ -228,7 +322,7 @@ class Client {
       delay: reconnection.delay,
       maxDelay: reconnection.maxDelay,
       retries: reconnection.retries,
-      auth: reconnection.settings?._auth,
+      auth: reconnection.settings?.auth,
     );
 
     if (reconnection.retries < 1) {
@@ -315,8 +409,6 @@ class Client {
       },
     );
 
-    final future = Future(() {});
-
     // Track errors
     if (_settings!.timeout != null) {
       record.timeout = Timer(Duration(seconds: _settings!.timeout ?? 5), () {
@@ -336,10 +428,10 @@ class Client {
       return Future.error(NesError(e, ErrorTypes.WS));
     }
 
-    return future;
+    return Future.microtask(() {});
   }
 
-  _hello(auth) {
+  Future _hello(_Auth? auth) {
     final _request = _SendRequest(type: 'hello', version: version);
 
     if (auth != null) {
@@ -534,7 +626,7 @@ class Client {
   }
 
   bool overrideReconnectionAuth(_Auth auth) {
-    if (_reconnection == null) {
+    if (_reconnection == null && _reconnection!.settings == null) {
       return false;
     }
     _reconnection!.settings!.auth = auth;
@@ -543,133 +635,83 @@ class Client {
 }
 
 class _Reconnection {
-  late int _wait;
-  late int _delay;
-  late int _maxDelay;
-  late double _retries;
-  _HeadersSettings? _settings;
+  int wait;
+  final int delay;
+  final int maxDelay;
+  double retries;
+  _HeadersSettings? settings;
 
   _Reconnection(
-      {required int wait,
-      required int delay,
-      required int maxDelay,
-      required double retries,
-      _HeadersSettings? settings}) {
-    _wait = wait;
-    _delay = delay;
-    _maxDelay = maxDelay;
-    _retries = retries;
-    _settings = settings;
-  }
-
-  int get wait => _wait;
-  int get delay => _delay;
-  int get maxDelay => _maxDelay;
-  double get retries => _retries;
-  _HeadersSettings? get settings => _settings;
-
-  set wait(int newVal) {
-    _wait = newVal;
-  }
-
-  set delay(int newVal) {
-    _delay = newVal;
-  }
-
-  set maxDelay(int newVal) {
-    _maxDelay = newVal;
-  }
-
-  set retries(double newVal) {
-    _retries = newVal;
-  }
-
-  set settings(_HeadersSettings? newVal) {
-    _settings = newVal;
-  }
+      {required this.wait,
+      required this.delay,
+      required this.maxDelay,
+      required this.retries,
+      _HeadersSettings? settings});
 }
 
 class _HeadersSettings {
-  int? _timeout;
-  _Auth? _auth;
+  int? timeout;
+  _Auth? auth;
 
-  _HeadersSettings({int? timeout, _Auth? auth}) {
-    _auth = auth;
-    _timeout = timeout;
-  }
+  _HeadersSettings({this.timeout, this.auth});
 
   factory _HeadersSettings.fromJson(String str) =>
       _HeadersSettings.fromMap(json.decode(str));
   String toJson() => json.encode(toMap());
 
-  factory _HeadersSettings.fromMap(Map<String, dynamic> json) =>
+  factory _HeadersSettings.fromMap(Map<String, dynamic> _json) =>
       _HeadersSettings(
-        auth: _Auth.fromMap(json['auth']),
-        timeout: json['timeout'],
+        auth: _Auth.fromMap(_json['auth']),
+        timeout: _json['timeout'],
       );
   Map<String, dynamic> toMap() => {
-        'auth': _auth != null ? _auth!.toMap() : _auth,
-        'timeout': _timeout,
+        'auth': auth != null ? auth!.toMap() : auth,
+        'timeout': timeout,
       };
-
-  int? get timeout => _timeout;
-  _Auth? get auth => _auth;
-
-  set timeout(int? newVal) {
-    _timeout = newVal;
-  }
-
-  set auth(_Auth? newVal) {
-    _auth = newVal;
-  }
 }
 
 class _Auth {
-  _Headers? _headers;
-  _Auth(this._headers);
+  _Headers? headers;
+  _Auth(this.headers);
 
   factory _Auth.fromJson(String str) => _Auth.fromMap(json.decode(str));
   String toJson() => json.encode(toMap());
 
-  factory _Auth.fromMap(Map<String, dynamic> json) =>
-      _Auth(_Headers.fromMap(json['headers']));
+  factory _Auth.fromMap(Map<String, dynamic> _json) => _Auth(
+      _Headers.fromMap(_json.containsKey('headers') ? _json['headers'] : {}));
   Map<String, dynamic> toMap() =>
-      {'headers': _headers != null ? _headers!.toMap() : null};
-
-  _Headers? get headers => _headers;
-  set headers(_Headers? newVal) {
-    _headers = newVal;
-  }
+      {'headers': headers != null ? headers!.toMap() : null};
 }
 
 class _Headers {
-  String? _cookie;
-  String? _authorization;
-  _Headers({String? authorization, String? cookie}) {
-    _cookie = cookie;
-    _authorization = authorization;
-  }
+  String? cookie;
+  String? authorization;
+  _Headers({this.authorization, this.cookie});
 
   factory _Headers.fromJson(String str) => _Headers.fromMap(json.decode(str));
   String toJson() => json.encode(toMap());
 
-  factory _Headers.fromMap(Map<String, dynamic> json) => _Headers(
-        authorization: json['authorization'] ?? json['Authorization'],
-        cookie: json['cookie'] ?? json['Cookie'],
+  factory _Headers.fromMap(Map<String, dynamic> _json) => _Headers(
+        authorization: _json.containsKey('authorization')
+            ? _json['authorization']
+            : _json.containsKey('Authorization')
+                ? _json['Authorization']
+                : null,
+        cookie: _json.containsKey('cookie')
+            ? _json['cookie']
+            : _json.containsKey('Cookie')
+                ? _json['Cookie']
+                : null,
       );
-  Map<String, dynamic> toMap() => {
-        'Authorization': _authorization,
-        'Cookie': _cookie,
-      };
-
-  String? get authorization => _authorization;
-  set authorization(String? newVal) {
-    _authorization = newVal;
-  }
-
-  String? get cookie => _cookie;
-  set cookie(String? newVal) {
-    _cookie = newVal;
+  Map<String, dynamic> toMap() {
+    Map<String, dynamic> _headersMap = {};
+    if (authorization != null) {
+      _headersMap['authorization'] = authorization;
+    }
+    if (cookie != null) {
+      _headersMap['cookie'] = cookie;
+    }
+    return _headersMap;
   }
 }
 
@@ -704,17 +746,17 @@ class _SendRequest {
   factory _SendRequest.fromJson(String str) =>
       _SendRequest.fromMap(json.decode(str));
 
-  factory _SendRequest.fromMap(Map<String, dynamic> json) => _SendRequest(
-        type: json['type'],
-        id: json['id'],
-        method: json['method'],
-        auth: json['auth'],
-        path: json['path'],
-        headers: json['headers'],
-        message: json['message'],
-        payload: json['payload'],
-        version: json['version'],
-        subs: json['subs'],
+  factory _SendRequest.fromMap(Map<String, dynamic> _json) => _SendRequest(
+        type: _json['type'],
+        id: _json['id'],
+        method: _json['method'],
+        auth: _json['auth'],
+        path: _json['path'],
+        headers: _json['headers'],
+        message: _json['message'],
+        payload: _json['payload'],
+        version: _json['version'],
+        subs: _json['subs'],
       );
 
   String toJson() => json.encode(toMap());
@@ -890,4 +932,45 @@ class _HeartbeatTimes {
   int? timeout;
   int? interval;
   _HeartbeatTimes({this.timeout, this.interval});
+}
+
+class _Event {
+  final int? code;
+  final String? explanation;
+  final String? reason;
+  final bool? wasClean;
+  final bool? willReconnect;
+  final bool? wasRequested;
+
+  _Event({
+    this.code,
+    this.explanation,
+    this.reason,
+    this.wasClean,
+    this.willReconnect,
+    this.wasRequested,
+  });
+
+  factory _Event.fromMap(Map<String, dynamic> _json) => _Event(
+        code: _json['code'],
+        explanation: _json['explanation'],
+        reason: _json['reason'],
+        wasClean: _json['wasClean'],
+        willReconnect: _json['willReconnect'],
+        wasRequested: _json['wasRequested'],
+      );
+
+  factory _Event.fromJson(String str) =>
+      _Event.fromMap(Map<String, dynamic>.from(json.decode(str)));
+
+  Map<String, dynamic> toMap() => {
+        'code': code,
+        'explanation': explanation,
+        'reason': reason,
+        'wasClean': wasClean,
+        'willReconnect': willReconnect,
+        'wasRequested': wasRequested,
+      };
+
+  String toJson() => json.encode(toMap());
 }
