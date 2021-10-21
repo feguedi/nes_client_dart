@@ -8,8 +8,8 @@ issue_tracker: https://github.com/feguedi/nes_client_dart/issues
 environment:
   sdk: '>=2.14.3 <3.0.0'
 
-# dependencies:
-#   path: ^1.8.0
 dev_dependencies:
   lints: ^1.0.0
   test: ^1.18.2
+dependencies:
+  web_socket_channel: ^2.1.0

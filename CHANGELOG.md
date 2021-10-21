@@ -1,3 +1,7 @@
+## 0.1.0
+
+- Using the web_socket_channel package again
+
 ## 0.0.3
 
 - Copied all the functions as they are in the Javascript client
