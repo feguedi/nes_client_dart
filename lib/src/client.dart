@@ -368,7 +368,12 @@ class Client {
     return _send(_request, true);
   }
 
-  message() {}
+  message(String msg) {
+    final request = _SendRequest(type: 'message', message: msg);
+
+    return _send(request, true);
+  }
+
   _isReady() {
     return _ws != null && _ws!.readyState == WebSocket.open;
   }
@@ -421,14 +426,14 @@ class Client {
     _requests![request.id.toString()] = record;
 
     try {
-      _ws!.add(encoded);
+      return Future.microtask(() {
+        _ws!.add(encoded);
+      });
     } catch (e) {
       _requests![request.id.toString()].timeout?.cancel();
       _requests!.remove(request.id.toString());
       return Future.error(NesError(e, ErrorTypes.WS));
     }
-
-    return Future.microtask(() {});
   }
 
   Future _hello(_Auth? auth) {

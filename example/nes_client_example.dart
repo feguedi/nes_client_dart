@@ -2,13 +2,20 @@ import 'package:nes_client/nes_client.dart';
 
 void main() async {
   try {
-    final NesClient nesClient = NesClient('ws://192.168.1.89:3000');
-    await nesClient.connect(headers: {'Authorization': 'Bearer token'});
+    // Subscription filter example
+    // https://hapi.dev/module/nes/api?v=12.0.4#subscription-filter
+    final NesClient nesClient = NesClient('ws://localhost:3003');
+    await nesClient.connect(
+      auth: {
+        'headers': {'Authorization': 'Basic am9objpzZWNyZXQ='}
+      },
+    );
 
     print('connected');
 
-    await nesClient.subscribe('/timeline/updates', (item) {
-      print('item: ${item.toString()}');
+    await nesClient.subscribe('/items', (update, flags) {
+      print('update: ${update.toString()}');
+      print('flags: ${flags.toString()}');
     });
   } catch (e) {
     rethrow;
