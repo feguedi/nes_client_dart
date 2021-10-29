@@ -1,17 +1,13 @@
 {
   "name": "subscription-filter",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Example from the (hapi)nes API documentation https://hapi.dev/module/nes/api?v=12.0.4#server-4",
   "scripts": {
     "start": "node index",
     "dev": "nodemon index.js -e js --ignore client/",
     "client": "nodemon client/index.js -e js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "@hapi/basic": "^6.0.0",
     "@hapi/hapi": "^20.2.1",

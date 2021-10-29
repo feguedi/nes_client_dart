@@ -222,11 +222,9 @@ class Client {
 
       return _ws!.stream.listen(
         (event) async {
-        _reconnectionTimer?.cancel();
           _onMessage(_Message.fromJson(event));
         },
         onError: (err) {
-      } catch (err) {
           final Map<String, dynamic>? mapErr = json.decode(err.toString());
           if (mapErr != null && mapErr.containsKey('path')) {
             _subscriptions?.remove(mapErr['path']);
@@ -596,16 +594,16 @@ class Client {
           final List<Function>? handlers =
               update.path == null ? null : _subscriptions![update.path ?? ''];
           if (update.type == 'revoke') {
-        _subscriptions!.remove(update.path);
-      }
+            _subscriptions!.remove(update.path);
+          }
 
-      if (handlers != null && update.message != null) {
-        final Map<String, dynamic> flags = {};
-        if (update.type == 'revoke') {
-          flags['revoked'] = true;
-        }
+          if (handlers != null && update.message != null) {
+            final Map<String, dynamic> flags = {};
+            if (update.type == 'revoke') {
+              flags['revoked'] = true;
+            }
 
-        for (Function handler in handlers) {
+            for (Function handler in handlers) {
               handler(update.message, flags);
             }
           }
