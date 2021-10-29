@@ -122,6 +122,7 @@ class NesClient {
     _reconnectionTimer = null;
 
     void finalize([NesError? err]) {
+      // print('_connect finalize err: $err');
       try {
         if (next != null) {
           final nextHolder = next!;
@@ -131,13 +132,14 @@ class NesClient {
           onError(err);
         }
       } on NesError {
+        // print('_connect finalize catch');
       } catch (e) {
         print(e);
       }
     }
 
     void reconnect([Map<String, dynamic>? event]) {
-      if (_ws!.innerWebSocket?.readyState == WebSocket.open) {
+      // print('_connect reconnect event: $event');
       try {
         if (_ws!.innerWebSocket?.readyState != WebSocket.open) {
           finalize(NesError(
@@ -182,10 +184,11 @@ class NesClient {
       timeout?.cancel();
 
       _hello(options?.auth).then((value) {
+        // print('_connect onOpen _hello value: $value');
         onConnect();
         finalize();
       }).catchError((err) {
-        if (err['path'] != null) {
+        // print('_connect onOpen catchError: $err');
         if (err is Map<String, dynamic> && err['path'] != null) {
           _subscriptions.remove(err['path']);
         }
@@ -204,13 +207,14 @@ class NesClient {
       return _ws!.stream.listen(
         (data) {
           try {
+            // print('_connect _ws.stream.listen: ${data.toString()}');
             _onMessage(_Response(data));
           } catch (e) {
             print(e is _HapiError ? e.reason : e.toString());
           }
         },
         onError: (event) {
-          final Map<String, dynamic>? mapErr = json.decode(err.toString());
+          // print('_connect _ws.stream.listen onError: ${event.toString()}');
           timeout?.cancel();
           if (_willReconnect()) {
             return reconnect(event);
@@ -400,6 +404,7 @@ class NesClient {
   }
 
   Future _send(_Request request, bool track) {
+    // print('_send request: ${request.toString()}');
 
     if (!_isReady()) {
       return Future.error(NesError(
@@ -419,7 +424,7 @@ class NesClient {
 
     if (!track) {
       try {
-        return Future(() {
+        // print('_send track - false : $encoded');
         _ws?.sink.add(encoded);
         return Future.value();
       } catch (e) {
@@ -448,7 +453,7 @@ class NesClient {
     _requests[request.id!] = record;
 
     try {
-      return Future(() {
+      // print('_send encoded: $encoded');
       _ws?.sink.add(encoded);
     } catch (e) {
       _requests[request.id!]!.timeout?.cancel();
@@ -578,7 +583,7 @@ class NesClient {
     _HapiError? error;
 
     if (update['statusCode'] != null && update['statusCode'] >= 400) {
-
+      // print('_onMessage statusCode ${update['statusCode']}');
       final String _msg_ = update['payload']['message'] != null
           ? update['payload']['error']
           : 'Error';
@@ -592,8 +597,7 @@ class NesClient {
       );
     }
 
-    switch (update.type) {
-
+    // print('_onMessage type ${update['type']}');
     switch (update['type']) {
       case 'ping':
         return _send(_Request(type: 'ping'), false).catchError(_ignore);
@@ -634,6 +638,7 @@ class NesClient {
 
     Future next(_HapiError? err, [args]) {
       if (err != null) {
+        // print('_onMessage next err: ${err.reason}');
         return Future.error(err);
       }
       return Future.value(args);

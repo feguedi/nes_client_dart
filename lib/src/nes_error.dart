@@ -56,16 +56,16 @@ class _NesError extends Error {
 }
 
 class NesError {
-  final ErrorTypes type;
+  final ErrorTypes errorType;
   final _NesError _nesError = _NesError();
 
-  NesError(err, this.type) {
+  NesError(err, this.errorType) {
     if (err is String) {
       final String errorTypeString =
-          type.toString().replaceAll('ErrorTypes.', '');
+          errorType.toString().replaceAll('ErrorTypes.', '');
       throw _throwException('$errorTypeString: $err');
     } else if (err is Object) {
-      _nesError.type = type;
+      _nesError.type = errorType;
       _nesError.isNes = true;
     }
 
