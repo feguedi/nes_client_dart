@@ -24,7 +24,7 @@ class Client {
   List? _packets = [];
   List<Function>? _disconnectListeners;
   bool? _disconnectRequested = false;
-  int? id;
+  String? id;
   String version = '2';
 
   Client(this._url, {Map<String, dynamic>? settings}) {
@@ -48,7 +48,7 @@ class Client {
     }
   }
 
-  nextTick(callback) {
+  _nextTick(callback) {
     return (err) => Future.delayed(Duration(seconds: 0), callback(err));
   }
 
@@ -108,8 +108,8 @@ class Client {
     if (reconnect != false) {
       _reconnection = _Reconnection(
         wait: 0,
-        delay: delay ?? 1000,
-        maxDelay: maxDelay ?? 5000,
+        delay: delay ?? 1,
+        maxDelay: maxDelay ?? 5,
         retries: retries ?? double.infinity,
         settings: _HeadersSettings(
           timeout: timeout,
@@ -146,14 +146,24 @@ class Client {
     });
   }
 
-  void _connect(_ConnectOptions options, bool initial, Function? next) async {
+  Future _connect(
+    _ConnectOptions options,
+    bool initial,
+    Function(NesError? err)? next,
+  ) async {
     _ws = IOWebSocketChannel.connect(
       Uri.parse(_url),
       protocols: _settings?.protocols,
       headers: options.auth?.headers?.toMap(),
     );
+    int timming = 1;
 
-    finalize(NesError? err) {
+    while (_ws!.innerWebSocket?.readyState != WebSocket.open) {
+      await Future.delayed(Duration(seconds: timming));
+      timming++;
+    }
+
+    finalize([NesError? err]) {
       if (next != null) {
         final nextHolder = next!;
         next = null;
@@ -188,26 +198,44 @@ class Client {
         ? Timer(Duration(seconds: options.timeout!), timeoutHandler)
         : null;
 
+    void onOpen() {
+      timeout?.cancel();
+
+      _hello(options.auth).then((value) {
+        onConnect();
+        finalize();
+      }).catchError((err) {
+        if (err['path'] != null) {
+          _subscriptions!.remove(err['path']);
+        }
+
+        _disconnect(() => _nextTick(finalize)(err), true);
+      });
+    }
+
     if (_reconnectionTimer != null) {
       _reconnectionTimer!.cancel();
       _reconnectionTimer = null;
     }
+    return Future(() {
+      onOpen();
 
-    _ws!.stream.listen((event) async {
-      try {
+      return _ws!.stream.listen(
+        (event) async {
         _reconnectionTimer?.cancel();
-        final _helloResponse = await _hello(options.auth);
-        onConnect();
-        finalize(null);
+          _onMessage(_Message.fromJson(event));
+        },
+        onError: (err) {
       } catch (err) {
-        final Map<String, dynamic>? mapErr = json.decode(err.toString());
-        if (mapErr != null && mapErr.containsKey('path')) {
-          _subscriptions?.remove(mapErr['path']);
-        }
+          final Map<String, dynamic>? mapErr = json.decode(err.toString());
+          if (mapErr != null && mapErr.containsKey('path')) {
+            _subscriptions?.remove(mapErr['path']);
+          }
 
-        _disconnect(() => nextTick(finalize)(err), true);
-      }
-      _onMessage(_Message.fromJson(event));
+          _disconnect(() => _nextTick(finalize)(err), true);
+        },
+        onDone: _reconnect(),
+      );
     });
   }
 
@@ -323,7 +351,7 @@ class Client {
 
     _reconnectionTimer = Timer(Duration(seconds: timeout), () {
       _connect(_connectOptions, false, (err) {
-        if (err) {
+        if (err != null) {
           onError(err);
           return _reconnect();
         }
@@ -347,7 +375,7 @@ class Client {
         headers: options['headers'],
         payload: options['payload']);
 
-    return await _send(_request, true);
+    return _send(_request, true);
   }
 
   bool _isReady() {
@@ -425,8 +453,7 @@ class Client {
       _request.subs = subs;
     }
 
-    final _sendResponse = await _send(_request, true);
-    return _sendResponse;
+    return _send(_request, true);
   }
 
   List<String> subscriptions() {
@@ -556,25 +583,19 @@ class Client {
           : NesError('Error', ErrorTypes.SERVER);
     }
 
-    // Ping
+    switch (update.type) {
+      case 'ping':
+        return _send(_SendRequest('ping'), false).catchError(_ignore);
 
-    if (update.type == 'ping') {
-      return _send(_SendRequest('ping'), false).catchError(_ignore);
-    }
+      case 'update':
+        return onUpdate(update.message);
 
-    // Broadcast and update
-
-    if (update.type == 'update') {
-      return onUpdate(update.message);
-    }
-
-    // Publish or revoke
-
-    if ((update.type == 'pub' || update.type == 'revoke') &&
-        update.path != null) {
-      final List<Function>? handlers =
-          update.path == null ? null : _subscriptions![update.path ?? ''];
-      if (update.type == 'revoke') {
+      case 'pub':
+      case 'revoke':
+        if (update.path != null) {
+          final List<Function>? handlers =
+              update.path == null ? null : _subscriptions![update.path ?? ''];
+          if (update.type == 'revoke') {
         _subscriptions!.remove(update.path);
       }
 
@@ -585,11 +606,15 @@ class Client {
         }
 
         for (Function handler in handlers) {
-          handler(update.message, flags);
+              handler(update.message, flags);
+            }
+          }
+          return;
         }
-      }
+        break;
 
-      return;
+      default:
+        break;
     }
 
     // Lookup request (message must include an id from this point)
@@ -600,16 +625,57 @@ class Client {
           'Received response for unknown request', ErrorTypes.PROTOCOL));
     }
 
-    if (request.timeout != null) {
-      request.timeout!.cancel();
-    }
-    _requests!.remove(update.id);
+    request.timeout?.cancel();
+    _requests?.remove(update.id);
 
-    next(err, args) {
+    Future next(err, [args]) {
       if (err != null) {
-        return request.reject!(err);
+        return Future.error(err);
       }
+
+      return Future.value(args);
     }
+
+    switch (update.type) {
+      case 'request':
+        return next(error, {
+          'payload': update.payload,
+          'statusCode': update.statusCode,
+          'headers': update.headers?.toMap(),
+        });
+
+      case 'message':
+        return next(error, {'payload': update.message});
+
+      case 'hello':
+        id = update.socket;
+        if (update.heartbeat != null) {
+          if (update.heartbeat?.interval != null &&
+              update.heartbeat?.timeout != null) {
+            _heartbeatTimeout =
+                update.heartbeat!.timeout! + update.heartbeat!.interval!;
+          }
+          _beat();
+        }
+        return next(error);
+
+      case 'reauth':
+        return next(error, true);
+
+      case 'sub':
+      case 'unsub':
+        return next(error);
+    }
+
+    return Future(() {
+      next(NesError('Received invalid response', ErrorTypes.PROTOCOL));
+      return onError(
+        NesError(
+          'Received unknown response type: ${update!.type}',
+          ErrorTypes.PROTOCOL,
+        ),
+      );
+    });
   }
 
   _beat() {
@@ -880,7 +946,7 @@ class _Message {
   factory _Message.fromJson(String str) => _Message(str);
 
   Map<String, dynamic> toMap() => {'data': data};
-  String toJson() => json.encode(toMap());
+  String toJson() => json.encode(data);
 
   @override
   String toString() => toJson();
