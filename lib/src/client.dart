@@ -8,262 +8,269 @@ import 'package:web_socket_channel/io.dart';
 
 import './nes_error.dart';
 
-class Client {
-  final String _url;
-  _Settings? _settings;
+class NesClient {
+  final String _version = '2';
 
-  int? _heartbeatTimeout;
+  final String _url;
+  _Settings _settings = _Settings.fromMap({});
 
   IOWebSocketChannel? _ws;
   _Reconnection? _reconnection;
   Timer? _reconnectionTimer;
-  int? _ids = 0;
-  HashMap<String, dynamic>? _requests = HashMap.from({});
-  HashMap<String, dynamic>? _subscriptions = HashMap.from({});
+  int _ids = 0;
+  HashMap<String, _Record> _requests = HashMap.from({});
+  HashMap<String, List<dynamic>> _subscriptions = HashMap.from({});
   Timer? _heartbeat;
-  List? _packets = [];
+  int? _heartbeatTimeout;
+  List _packets = [];
   List<Function>? _disconnectListeners;
   bool? _disconnectRequested = false;
-  String? id;
-  String version = '2';
 
-  Client(this._url, {Map<String, dynamic>? settings}) {
-    _settings = _Settings.fromMap(settings ?? {});
-    _settings?.maxPayload = _settings?.maxPayload ?? 0;
-  }
+  String? id;
 
   _ignore() {}
+  _nextTick(Function cb) {
+    return (err) => Timer(Duration(seconds: 0), cb(err));
+  }
 
   onError(err) => print(err);
   onConnect() => _ignore();
   onDisconnect([_]) => _ignore();
-  onHeartbeatTimeout() => _ignore();
-  onUpdate([_]) => _ignore();
+  onHeartbeatTimeout(_) => _ignore();
+  onUpdate(update) => _ignore();
 
-  String? _stringify(Object? message) {
-    try {
-      return json.encode(message);
-    } catch (e) {
-      throw NesError(e, ErrorTypes.USER);
-    }
-  }
-
-  _nextTick(callback) {
-    return (err) => Future.delayed(Duration(seconds: 0), callback(err));
+  NesClient(this._url, [Map<String, dynamic>? options]) {
+    _settings = options != null ? _Settings.fromMap(options) : _settings;
   }
 
   Future connect({
+    auth,
     bool? reconnect,
-    int? timeout,
+    int? wait,
     int? delay,
     int? maxDelay,
     double? retries,
-    Map<String, Map<String, String>>? auth,
-  }) async {
-    final Map<String, String>? _headers = auth != null &&
-            auth.containsKey('headers') &&
-            (auth['headers']!.containsKey('authorization') ||
-                auth['headers']!.containsKey('Authorization') ||
-                auth['headers']!.containsKey('cookie') ||
-                auth['headers']!.containsKey('Cookie'))
-        ? auth['headers']
-        : null;
-    final _ConnectOptions _connectOptions = _ConnectOptions(
-      reconnect: reconnect,
-      timeout: timeout,
-      delay: delay,
-      maxDelay: maxDelay,
-      retries: retries,
-      auth: _headers != null
-          ? _Auth.fromMap({
-              'headers': {
-                'authorization': _headers.containsKey('authorization')
-                    ? _headers['authorization']
-                    : _headers.containsKey('Authorization')
-                        ? _headers['Authorization']
-                        : null,
-                'cookie': _headers.containsKey('cookie')
-                    ? _headers['cookie']
-                    : _headers.containsKey('Cookie')
-                        ? _headers['Cookie']
-                        : null,
-              },
-            })
-          : null,
-    );
-
+    int? timeout,
+  }) {
     if (_reconnection != null) {
-      return Future.error(
-        NesError(
-          'Cannot connect while client attempts to reconnect',
-          ErrorTypes.USER,
-        ),
-      );
+      return Future.error(NesError(
+        'Cannot connect while client attempts to reconnect',
+        ErrorTypes.USER,
+      ));
     }
-
     if (_ws != null) {
       return Future.error(NesError('Already connected', ErrorTypes.USER));
     }
 
+    final Map<String, dynamic>? _authMap =
+        auth != null && auth is Map ? Map.from(auth) : null;
+
+    final _Auth? _connectAuth = _authMap != null
+        ? _Auth.fromMap(_authMap)
+        : auth is String
+            ? _Auth(token: auth)
+            : null;
+
     if (reconnect != false) {
       _reconnection = _Reconnection(
-        wait: 0,
-        delay: delay ?? 1,
-        maxDelay: maxDelay ?? 5,
+        wait: wait,
+        delay: delay ?? 1000,
+        maxDelay: maxDelay ?? 5000,
         retries: retries ?? double.infinity,
-        settings: _HeadersSettings(
+        settings: _Settings(
           timeout: timeout,
-          auth: _headers != null
-              ? _Auth.fromMap({
-                  'headers': {
-                    'authorization': _headers.containsKey('authorization')
-                        ? _headers['authorization']
-                        : _headers.containsKey('Authorization')
-                            ? _headers['Authorization']
-                            : null,
-                    'cookie': _headers.containsKey('cookie')
-                        ? _headers['cookie']
-                        : _headers.containsKey('Cookie')
-                            ? _headers['Cookie']
-                            : null,
-                  },
-                })
-              : null,
+          auth: _connectAuth,
         ),
       );
     } else {
       _reconnection = null;
     }
 
-    return Future.microtask(() {
-      _connect(_connectOptions, true, (err) {
+    return _connect(
+      _ConnectOptions(
+        auth: _connectAuth,
+        timeout: timeout,
+        delay: delay,
+        maxDelay: maxDelay,
+        retries: retries ?? double.infinity,
+      ),
+      true,
+      (NesError? err) {
         if (err != null) {
           return Future.error(err);
         }
-
         return Future.value();
-      });
-    });
+      },
+    );
   }
 
   Future _connect(
-    _ConnectOptions options,
-    bool initial,
+    _ConnectOptions? options,
+    bool initial, [
     Function(NesError? err)? next,
-  ) async {
-    _ws = IOWebSocketChannel.connect(
-      Uri.parse(_url),
-      protocols: _settings?.protocols,
-      headers: options.auth?.headers?.toMap(),
-    );
+  ]) async {
+    _ws = IOWebSocketChannel.connect(Uri.parse(_url));
     int timming = 1;
 
     while (_ws!.innerWebSocket?.readyState != WebSocket.open) {
       await Future.delayed(Duration(seconds: timming));
       timming++;
+      print('connecting');
     }
 
-    finalize([NesError? err]) {
-      if (next != null) {
-        final nextHolder = next!;
-        next = null;
-        return nextHolder(err);
+    _reconnectionTimer?.cancel();
+    _reconnectionTimer = null;
+
+    void finalize([NesError? err]) {
+      try {
+        if (next != null) {
+          final nextHolder = next!;
+          next = null;
+          nextHolder(err);
+        } else {
+          onError(err);
+        }
+      } on NesError {
+      } catch (e) {
+        print(e);
       }
     }
 
-    reconnect(_Event event) {
+    void reconnect([Map<String, dynamic>? event]) {
       if (_ws!.innerWebSocket?.readyState == WebSocket.open) {
-        finalize(NesError(
-            'Connection terminated while waiting to connect', ErrorTypes.WS));
+      try {
+        if (_ws!.innerWebSocket?.readyState != WebSocket.open) {
+          finalize(NesError(
+            'Connection terminated while waiting to connect',
+            ErrorTypes.WS,
+          ));
+        }
+      } catch (e) {
+        print(e);
+      } finally {
+        final bool? wasRequested = _disconnectRequested;
+
+        _cleanup();
+
+        final eventMap = event != null
+            ? {
+                ...event,
+                'willReconnect': _willReconnect(),
+                'wasRequested': wasRequested,
+              }
+            : null;
+        final log = _Log.fromMap(eventMap ?? {});
+
+        onDisconnect([log.willReconnect, log]);
+        _reconnect();
       }
-
-      final wasRequested = _disconnectRequested;
-
-      _cleanup();
-
-      onDisconnect([event.willReconnect, event]);
-      _reconnect();
     }
 
     timeoutHandler() {
       _cleanup();
       finalize(NesError('Connection timed out', ErrorTypes.TIMEOUT));
-
       if (initial) {
         return _reconnect();
       }
     }
 
-    final Timer? timeout = options.timeout != null
-        ? Timer(Duration(seconds: options.timeout!), timeoutHandler)
+    final Timer? timeout = options?.timeout != null
+        ? Timer(Duration(milliseconds: options!.timeout!), timeoutHandler)
         : null;
 
     void onOpen() {
       timeout?.cancel();
 
-      _hello(options.auth).then((value) {
+      _hello(options?.auth).then((value) {
         onConnect();
         finalize();
       }).catchError((err) {
         if (err['path'] != null) {
-          _subscriptions!.remove(err['path']);
+        if (err is Map<String, dynamic> && err['path'] != null) {
+          _subscriptions.remove(err['path']);
         }
 
-        _disconnect(() => _nextTick(finalize)(err), true);
+        if (err is NesError) {
+          _disconnect(() => _nextTick(finalize)(err), true);
+        }
+
+        throw err;
       });
     }
 
-    if (_reconnectionTimer != null) {
-      _reconnectionTimer!.cancel();
-      _reconnectionTimer = null;
-    }
     return Future(() {
       onOpen();
 
       return _ws!.stream.listen(
-        (event) async {
-          _onMessage(_Message.fromJson(event));
+        (data) {
+          try {
+            _onMessage(_Response(data));
+          } catch (e) {
+            print(e is _HapiError ? e.reason : e.toString());
+          }
         },
-        onError: (err) {
+        onError: (event) {
           final Map<String, dynamic>? mapErr = json.decode(err.toString());
-          if (mapErr != null && mapErr.containsKey('path')) {
-            _subscriptions?.remove(mapErr['path']);
+          timeout?.cancel();
+          if (_willReconnect()) {
+            return reconnect(event);
           }
 
-          _disconnect(() => _nextTick(finalize)(err), true);
+          _cleanup();
+          final error = NesError('Socket error', ErrorTypes.WS);
+          return finalize(error);
         },
-        onDone: _reconnect(),
+        onDone: reconnect,
+        cancelOnError: false,
       );
     });
   }
 
-  bool overrideReconnectionAuth(_Auth auth) {
-    if (_reconnection == null && _reconnection!.settings == null) {
+  bool overrideReconnectionAuth(auth) {
+    if (_reconnection == null) {
       return false;
     }
-    _reconnection!.settings!.auth = auth;
+    Map<String, dynamic>? authMap;
+    String? authString;
+    final authParsed = json.decode(auth);
+    if (authParsed is Map) {
+      authMap = authParsed.cast<String, dynamic>();
+    } else if (authParsed is String) {
+      authString = authParsed;
+    } else {
+      return false;
+    }
+
+    _reconnection!.settings?.auth = _Auth(
+      headers: authMap != null ? _Headers.fromMap(authMap) : null,
+      token: authString,
+    );
     return true;
   }
 
-  reauthenticate(_Auth auth) {
-    overrideReconnectionAuth(auth);
+  Future reauthenticate(Map<String, dynamic> options) {
+    overrideReconnectionAuth(options);
 
-    final _SendRequest _request = _SendRequest('reauth', auth: auth);
+    final request = _Request(
+      type: 'reauth',
+      auth: _Auth.fromMap(options),
+    );
 
-    return _send(_request, true);
+    return _send(request, true);
   }
 
-  disconnect() {
-    return Future.microtask(() {
-      _disconnect(() {}, false);
+  Future disconnect() {
+    return Future(() {
+      return _disconnect(() {}, false);
     });
   }
 
-  Future _disconnect(Function next, isInternal) async {
+  void _disconnect(Function next, bool isInternal) {
     _reconnection = null;
-    _reconnectionTimer!.cancel();
+    _reconnectionTimer?.cancel();
     _reconnectionTimer = null;
-    final requested = _disconnectRequested! || !isInternal;
+
+    final bool requested = _disconnectRequested ?? isInternal;
 
     if (_disconnectListeners != null) {
       _disconnectRequested = requested;
@@ -272,14 +279,15 @@ class Client {
     }
 
     if (_ws == null ||
-        (_ws!.innerWebSocket?.readyState != WebSocket.open &&
-            _ws!.innerWebSocket?.readyState != WebSocket.connecting)) {
+        _ws!.innerWebSocket == null ||
+        _ws!.innerWebSocket!.readyState != WebSocket.open ||
+        _ws!.innerWebSocket!.readyState != WebSocket.connecting) {
       return next();
     }
 
     _disconnectRequested = requested;
     _disconnectListeners = [next];
-    await _ws!.sink.close();
+    _ws!.sink.close();
   }
 
   _cleanup() {
@@ -304,13 +312,17 @@ class Client {
         NesError('Request failed - server disconnected', ErrorTypes.DISCONNECT);
 
     final requests = _requests;
-    _requests!.clear();
-    final ids = requests!.keys;
+    _requests.clear();
+    final ids = requests.keys;
 
     for (var id in ids) {
       final request = requests[id];
-      request['timeout'].cancel();
-      request['reject'](error);
+      if (request != null) {
+        request.timeout?.cancel();
+
+        request.reject = (_) => Future.error(_!);
+        request.reject!(error);
+      }
     }
 
     if (_disconnectListeners != null) {
@@ -329,180 +341,191 @@ class Client {
       return;
     }
 
-    final _connectOptions = _ConnectOptions(
-      reconnect: true,
-      timeout: reconnection.settings?.timeout,
-      delay: reconnection.delay,
-      maxDelay: reconnection.maxDelay,
-      retries: reconnection.retries,
-      auth: reconnection.settings?.auth,
-    );
-
-    if (reconnection.retries < 1) {
+    if (reconnection.retries! < 1) {
       return _disconnect(_ignore, true);
     }
 
-    reconnection.retries--;
-    reconnection.wait = reconnection.wait + reconnection.delay;
+    reconnection.retries = reconnection.retries ?? 1;
+    reconnection.retries = reconnection.retries! - 1;
 
-    final timeout = math.min(reconnection.wait, reconnection.maxDelay);
+    reconnection.wait = reconnection.wait ?? 0;
+    reconnection.wait = reconnection.wait! + (reconnection.delay ?? 0);
 
-    _reconnectionTimer = Timer(Duration(seconds: timeout), () {
-      _connect(_connectOptions, false, (err) {
-        if (err != null) {
-          onError(err);
-          return _reconnect();
-        }
-      });
+    final timeout = math.min(reconnection.wait!, reconnection.maxDelay ?? 0);
+
+    _reconnectionTimer = Timer(Duration(milliseconds: timeout), () {
+      _connect(
+        reconnection.settings != null
+            ? _ConnectOptions.fromMap(reconnection.settings!.toMap())
+            : _ConnectOptions(retries: double.infinity),
+        false,
+        (err) {
+          if (err != null) {
+            onError(err);
+            return _reconnect();
+          }
+        },
+      );
     });
   }
 
-  Future request({Map<String, dynamic>? options, String? path}) async {
-    if (options == null && path != null) {
-      options = {
-        'method': 'GET',
-        'path': path,
-      };
-    } else if (options == null && path == null) {
-      return;
-    }
+  Future request({
+    required String path,
+    String? method,
+    Map<String, dynamic>? headers,
+    Map<String, dynamic>? payload,
+  }) {
+    final request = _Request(
+      type: 'request',
+      method: method ?? 'GET',
+      path: path,
+      headers: _Headers.fromMap(headers ?? {}),
+      payload: _Payload.fromMap(payload ?? {}),
+    );
 
-    final _request = _SendRequest('request',
-        method: options!['method'],
-        path: options['path'],
-        headers: options['headers'],
-        payload: options['payload']);
-
-    return _send(_request, true);
+    return _send(request, true);
   }
+
+  Future message(String message) => _send(
+      _Request(
+        type: 'message',
+        message: message,
+      ),
+      true);
 
   bool _isReady() {
-    return _ws != null && _ws!.innerWebSocket?.readyState == WebSocket.open;
+    return _ws != null &&
+        _ws!.innerWebSocket != null &&
+        _ws!.innerWebSocket!.readyState == WebSocket.open;
   }
 
-  Future _send(_SendRequest request, bool track) {
+  Future _send(_Request request, bool track) {
+
     if (!_isReady()) {
       return Future.error(NesError(
           'Failed to send message - server disconnected',
           ErrorTypes.DISCONNECT));
     }
 
-    _ids = _ids! + 1;
-    request.id = _ids;
+    _ids++;
+    request.id = _ids.toString();
     String encoded;
 
     try {
-      encoded = json.encode(request.toMap());
+      encoded = request.toString();
     } catch (e) {
       return Future.error(e);
     }
 
-    // Ignore errors
     if (!track) {
       try {
         return Future(() {
-          _ws!.sink.add(encoded);
-        });
+        _ws?.sink.add(encoded);
+        return Future.value();
       } catch (e) {
-        return Future.error(e);
+        return Future.error(NesError(e.toString(), ErrorTypes.WS));
       }
     }
 
-    final record = _Request(
-      reject: (NesError reason) {
-        return Future.error(reason);
-      },
-      resolve: (value) {
-        return Future.value(value);
-      },
-    );
+    _Record record = _Record();
 
-    // Track errors
-    if (_settings!.timeout != null) {
-      record.timeout = Timer(Duration(seconds: _settings!.timeout ?? 5), () {
-        record.timeout = null;
-        return record
-            .reject!(NesError('Request timed out', ErrorTypes.TIMEOUT));
-      });
+    final future = Future(() {
+      record.resolve = () => Future.value();
+      record.reject = (err) => Future.error(err!);
+    });
+
+    Future timeoutHandler() {
+      record.timeout = null;
+      return record
+          .reject!(NesError('Requested timed out', ErrorTypes.TIMEOUT));
     }
 
-    _requests![request.id.toString()] = record;
+    if (_settings.timeout != null) {
+      record.timeout =
+          Timer(Duration(milliseconds: _settings.timeout!), timeoutHandler);
+    }
+
+    _requests[request.id!] = record;
 
     try {
       return Future(() {
-        _ws!.sink.add(encoded);
-      });
+      _ws?.sink.add(encoded);
     } catch (e) {
-      _requests![request.id.toString()].timeout?.cancel();
-      _requests!.remove(request.id.toString());
+      _requests[request.id!]!.timeout?.cancel();
+      _requests.remove(request.id!);
       return Future.error(NesError(e, ErrorTypes.WS));
     }
-  }
-
-  Future _hello(_Auth? auth) async {
-    final _request = _SendRequest('hello', version: version);
-
-    if (auth != null) {
-      _request.auth = auth;
-    }
-
-    final subs = subscriptions();
-    if (subs.isNotEmpty) {
-      _request.subs = subs;
-    }
-
-    return _send(_request, true);
-  }
-
-  List<String> subscriptions() {
-    return _subscriptions != null ? _subscriptions!.keys.toList() : [];
-  }
-
-  Future subscribe(String path, Function? handler) async {
-    if (path[0] != '/') {
-      return Future.error(NesError('Invalid path', ErrorTypes.USER));
-    }
-
-    final List? subs = _subscriptions![path];
-    if (subs != null) {
-      // Already subscribed
-      if (!subs.contains(handler)) {
-        subs.add(handler);
-      }
-      return;
-    }
-
-    _subscriptions![path] = [handler];
-
-    if (!_isReady()) {
-      // Queued subscription
-      return;
-    }
-
-    final _SendRequest _request = _SendRequest('sub', path: path);
-
-    final future = _send(_request, true);
-
-    future.catchError((ignoreError) {
-      _subscriptions!.remove(path);
-    });
 
     return future;
   }
 
-  Future unsubscribe(String? path, Function? handler) {
-    if (path == null || path[0] != '/') {
+  Future _hello(_Auth? auth) {
+    _Request request = _Request(
+      type: 'hello',
+      version: _version,
+    );
+    if (auth != null) {
+      request.auth = auth;
+    }
+
+    final List<String> subs = subscriptions();
+    if (subs.isNotEmpty) {
+      request.subs = subs;
+    }
+
+    return _send(request, true);
+  }
+
+  List<String> subscriptions() {
+    return _subscriptions.keys.toList();
+  }
+
+  Future subscribe(
+    String path, [
+    void Function(
+      dynamic,
+      Map<String, dynamic>? flags,
+    )?
+        handler,
+  ]) {
+    if (path[0] != '/') {
       return Future.error(NesError('Invalid path', ErrorTypes.USER));
     }
 
-    List? subs = _subscriptions![path];
+    final List? subs = _subscriptions[path];
+    if (subs != null) {
+      if (!subs.contains(handler)) {
+        subs.add(handler);
+      }
+      return Future.value();
+    }
+
+    _subscriptions[path] = [handler];
+
+    if (!_isReady()) {
+      return Future.value();
+    }
+
+    final _Request request = _Request(type: 'sub', path: path);
+
+    return _send(request, true).catchError((_) {
+      _subscriptions.remove(path);
+    });
+  }
+
+  Future unsubscribe(String path, Function? handler) {
+    if (path[0] != '/') {
+      return Future.error(NesError('Invalid path', ErrorTypes.USER));
+    }
+
+    final List? subs = _subscriptions[path];
     if (subs == null) {
       return Future.value();
     }
 
     bool _sync = false;
     if (handler == null) {
-      _subscriptions!.remove(path);
+      _subscriptions.remove(path);
       _sync = true;
     } else {
       final int pos = subs.indexOf(handler);
@@ -510,528 +533,273 @@ class Client {
         return Future.value();
       }
 
-      subs.removeAt(pos);
-      if (subs.isEmpty) {
-        _subscriptions!.remove(path);
+      subs.sublist(pos, 1);
+      if (subs.length == 0) {
+        _subscriptions.remove(path);
         _sync = true;
       }
     }
 
-    final request = _SendRequest('unsub', path: path);
-    final future = _send(request, true);
-    future.catchError((e) => print(e));
-
-    return future;
-  }
-
-  message(String msg) async {
-    try {
-      final _SendRequest request = _SendRequest('message', message: msg);
-
-      final _sendResponse = await _send(request, true);
-      return _sendResponse;
-    } on JsonUnsupportedObjectError {
-      throw JsonUnsupportedObjectError('The map passed can\'t be serialized');
-    } catch (e) {
-      rethrow;
+    if (!_sync || !_isReady()) {
+      return Future.value();
     }
+
+    final _Request request = _Request(type: 'unsub', path: path);
+
+    return _send(request, true).catchError(_ignore);
   }
 
-  _onMessage(_Message message) {
+  _onMessage(_Response msg) {
     _beat();
+    String? data = msg.data;
+    Map<String, dynamic> update;
 
-    _UpdateData? update;
-    String data = message.data;
-    Map<String, dynamic> mapData = json.decode(data);
-    final String prefix = data[0];
-
-    if (prefix != '{' && _packets != null) {
-      _packets!.add(data.substring(1));
-      if (prefix != '!') {
+    if (!data.startsWith('{')) {
+      _packets.add(data.substring(1));
+      if (!data.startsWith('!')) {
         return;
       }
 
-      data = _packets!.join('');
+      data = _packets.join('');
       _packets = [];
-    } else if (mapData.containsKey('statusCode') &&
-        mapData['statusCode'] >= 400) {
-      return onError(
-          NesError(mapData['payload']['message'], ErrorTypes.PROTOCOL));
     }
 
-    if (_packets!.isNotEmpty) {
+    if (_packets.length == 1) {
+      _packets = [];
       onError(NesError('Received an incomplete message', ErrorTypes.PROTOCOL));
     }
 
     try {
-      update = _UpdateData.fromJson(data);
+      update = json.decode(data);
     } catch (e) {
       return onError(NesError(e, ErrorTypes.PROTOCOL));
     }
 
-    // Recreate error
+    _HapiError? error;
 
-    NesError? error;
+    if (update['statusCode'] != null && update['statusCode'] >= 400) {
 
-    if (update.statusCode != null && update.statusCode! >= 400) {
-      error = update.payload != null &&
-              (update.payload!.message != null || update.payload!.error != null)
-          ? NesError(update.payload!.message ?? update.payload!.error,
-              ErrorTypes.SERVER)
-          : NesError('Error', ErrorTypes.SERVER);
+      final String _msg_ = update['payload']['message'] != null
+          ? update['payload']['error']
+          : 'Error';
+      error = _HapiError(
+        reason: _msg_,
+        type: ErrorTypes.SERVER,
+        headers: _Headers.fromMap(update['headers'] ?? {}),
+        path: update['path'] ?? '',
+        payload: _ErrorPayload.fromMap(update['payload'] ?? {}),
+        statusCode: update['statusCode'],
+      );
     }
 
     switch (update.type) {
+
+    switch (update['type']) {
       case 'ping':
-        return _send(_SendRequest('ping'), false).catchError(_ignore);
+        return _send(_Request(type: 'ping'), false).catchError(_ignore);
 
       case 'update':
-        return onUpdate(update.message);
+        return onUpdate(update['message']);
 
       case 'pub':
       case 'revoke':
-        if (update.path != null) {
-          final List<Function>? handlers =
-              update.path == null ? null : _subscriptions![update.path ?? ''];
-          if (update.type == 'revoke') {
-            _subscriptions!.remove(update.path);
-          }
-
-          if (handlers != null && update.message != null) {
-            final Map<String, dynamic> flags = {};
-            if (update.type == 'revoke') {
-              flags['revoked'] = true;
-            }
-
-            for (Function handler in handlers) {
-              handler(update.message, flags);
-            }
-          }
-          return;
+        final handlers = _subscriptions[update['path']];
+        if (update['type'] == 'revoke') {
+          _subscriptions.remove(update['path']);
         }
-        break;
 
+        if (handlers != null && update['message'] != null) {
+          Map<String, dynamic> flags = {};
+          if (update['type'] == 'revoke') {
+            flags['revoked'] = true;
+          }
+
+          for (var handler in handlers) {
+            handler(update['message'], flags);
+          }
+        }
+
+        return;
       default:
-        break;
     }
 
-    // Lookup request (message must include an id from this point)
-
-    final _Request? request = _requests![update.id];
+    final _Record? request = _requests[update['id']];
     if (request == null) {
       return onError(NesError(
           'Received response for unknown request', ErrorTypes.PROTOCOL));
     }
 
     request.timeout?.cancel();
-    _requests?.remove(update.id);
+    _requests.remove(update['id']);
 
-    Future next(err, [args]) {
+    Future next(_HapiError? err, [args]) {
       if (err != null) {
         return Future.error(err);
       }
-
       return Future.value(args);
     }
 
-    switch (update.type) {
+    switch (update['type']) {
+      // Response
       case 'request':
         return next(error, {
-          'payload': update.payload,
-          'statusCode': update.statusCode,
-          'headers': update.headers?.toMap(),
+          'payload': update['payload'],
+          'statusCode': update['statusCode'],
+          'headers': update['headers'],
         });
 
+      // Custom message
       case 'message':
-        return next(error, {'payload': update.message});
+        return next(error, {'payload': update['message']});
 
+      // Authentication
       case 'hello':
-        id = update.socket;
-        if (update.heartbeat != null) {
-          if (update.heartbeat?.interval != null &&
-              update.heartbeat?.timeout != null) {
-            _heartbeatTimeout =
-                update.heartbeat!.timeout! + update.heartbeat!.interval!;
-          }
+        id = update['socket'];
+        if (update['heartbeat'] != null) {
+          _heartbeatTimeout =
+              update['heartbeat']['interval'] + update['heartbeat']['timeout'];
           _beat();
         }
+
         return next(error);
 
       case 'reauth':
         return next(error, true);
 
+      // Subscriptions
       case 'sub':
       case 'unsub':
         return next(error);
+
+      default:
+        break;
     }
 
-    return Future(() {
-      next(NesError('Received invalid response', ErrorTypes.PROTOCOL));
-      return onError(
-        NesError(
-          'Received unknown response type: ${update!.type}',
-          ErrorTypes.PROTOCOL,
-        ),
-      );
-    });
+    next(_HapiError(
+      reason: 'Received invalid response',
+      type: ErrorTypes.PROTOCOL,
+    ));
+    return onError(NesError(
+      'Received unknown response type: ${update['type']}',
+      ErrorTypes.PROTOCOL,
+    ));
   }
 
-  _beat() {
-    if (_heartbeatTimeout == null) {
+  void _beat() {
+    if (_ws == null || _heartbeatTimeout == null) {
       return;
     }
 
-    _heartbeat!.cancel();
-    _heartbeat = Timer(Duration(seconds: _heartbeatTimeout!), () {
+    _heartbeat?.cancel();
+
+    _heartbeat = Timer(Duration(milliseconds: _heartbeatTimeout!), () {
       onError(NesError(
           'Disconnecting due to heartbeat timeout', ErrorTypes.TIMEOUT));
-      onHeartbeatTimeout();
+      onHeartbeatTimeout(_willReconnect());
       _ws!.sink.close();
     });
   }
+
+  bool _willReconnect() {
+    return _reconnection != null && _reconnection!.retries! >= 1;
+  }
+
+  IOWebSocketChannel? get channel => _ws;
 }
 
-class _Reconnection {
-  int wait;
-  final int delay;
-  final int maxDelay;
-  double retries;
-  _HeadersSettings? settings;
-
-  _Reconnection({
-    required this.wait,
-    required this.delay,
-    required this.maxDelay,
-    required this.retries,
-    _HeadersSettings? settings,
-  });
-}
-
-class _HeadersSettings {
+class _Settings {
+  _WS? ws;
   int? timeout;
+  _Headers? headers;
   _Auth? auth;
 
-  _HeadersSettings({this.timeout, this.auth});
+  _Settings({
+    this.ws,
+    this.timeout,
+    this.headers,
+    this.auth,
+  });
 
-  factory _HeadersSettings.fromJson(String str) =>
-      _HeadersSettings.fromMap(json.decode(str));
+  factory _Settings.fromMap(Map<String, dynamic> _json) => _Settings(
+        ws: _json['ws'] != null ? _WS.fromMap(_json['ws']) : null,
+        timeout: _json['timeout'],
+        auth: _json['auth'] != null ? _Auth.fromMap(_json['auth']) : null,
+        headers: _json['headers'] == null
+            ? null
+            : _Headers.fromMap(_json['headers']),
+      );
+  factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> _settingsMap = {};
+    if (ws != null) {
+      _settingsMap['ws'] = ws;
+    }
+    if (auth != null) {
+      _settingsMap['auth'] = auth;
+    }
+    if (timeout != null) {
+      _settingsMap['timeout'] = timeout;
+    }
+    return _settingsMap;
+  }
+
   String toJson() => json.encode(toMap());
 
-  factory _HeadersSettings.fromMap(Map<String, dynamic> _json) =>
-      _HeadersSettings(
-        auth: _Auth.fromMap(_json['auth']),
-        timeout: _json['timeout'],
-      );
-  Map<String, dynamic> toMap() => {
-        'auth': auth != null ? auth!.toMap() : auth,
-        'timeout': timeout,
-      };
+  @override
+  String toString() => toJson();
 }
 
 class _Auth {
   _Headers? headers;
-  _Auth(this.headers);
+  String? token;
 
-  factory _Auth.fromJson(String str) => _Auth.fromMap(json.decode(str));
-  String toJson() => json.encode(toMap());
+  _Auth({this.headers, this.token});
 
+  factory _Auth.fromJson(String str) {
+    if (json.decode(str) is Map) {
+      return _Auth.fromMap(json.decode(str));
+    } else {
+      return _Auth(token: str);
+    }
+  }
   factory _Auth.fromMap(Map<String, dynamic> _json) => _Auth(
-      _Headers.fromMap(_json.containsKey('headers') ? _json['headers'] : {}));
-  Map<String, dynamic> toMap() => {
-        'headers': headers != null ? headers!.toMap() : null,
-      };
-
-  @override
-  String toString() => toJson();
-}
-
-class _Headers {
-  String? cookie;
-  String? authorization;
-  _Headers({this.authorization, this.cookie});
-
-  factory _Headers.fromJson(String str) => _Headers.fromMap(json.decode(str));
-  String toJson() => json.encode(toMap());
-
-  factory _Headers.fromMap(Map<String, dynamic> _json) => _Headers(
-        authorization: _json.containsKey('authorization')
-            ? _json['authorization']
-            : _json.containsKey('Authorization')
-                ? _json['Authorization']
-                : null,
-        cookie: _json.containsKey('cookie')
-            ? _json['cookie']
-            : _json.containsKey('Cookie')
-                ? _json['Cookie']
-                : null,
-      );
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> _headersMap = {};
-    if (authorization != null) {
-      _headersMap['authorization'] = authorization;
-    }
-    if (cookie != null) {
-      _headersMap['cookie'] = cookie;
-    }
-    return _headersMap;
-  }
-
-  @override
-  String toString() => toJson();
-}
-
-class _SendRequest {
-  int? id;
-  String type;
-  String? method = 'GET';
-  _Auth? auth;
-  String? path;
-  _Headers? headers;
-  String? message;
-  String? payload;
-  String? version;
-  List<String>? subs;
-
-  _SendRequest(
-    this.type, {
-    this.method,
-    this.path,
-    this.id,
-    this.headers,
-    this.payload,
-    this.message,
-    this.auth,
-    this.subs,
-    this.version,
-  });
-
-  @override
-  String toString() => toJson();
-
-  factory _SendRequest.fromJson(String str) =>
-      _SendRequest.fromMap(json.decode(str));
-
-  factory _SendRequest.fromMap(Map<String, dynamic> _json) => _SendRequest(
-        _json['type'],
-        id: _json['id'],
-        method: _json['method'],
-        auth: _json['auth'],
-        path: _json['path'],
-        headers: _json['headers'],
-        message: _json['message'],
-        payload: _json['payload'],
-        version: _json['version'],
-        subs: _json['subs'],
+        headers: _Headers.fromMap(_json['headers'] ?? {}),
       );
 
-  String toJson() => json.encode(toMap());
   Map<String, dynamic> toMap() {
-    final Map<String, dynamic> _mapSendRequest = {
-      'type': type,
-    };
-    if (id != null) {
-      _mapSendRequest['id'] = id;
-    }
-    if (auth != null) {
-      _mapSendRequest['auth'] = auth!.toMap();
-    }
-    if (method != null) {
-      _mapSendRequest['method'] = method;
-    }
-    if (path != null) {
-      _mapSendRequest['path'] = path;
-    }
+    final Map<String, dynamic> _authMap = {};
     if (headers != null) {
-      _mapSendRequest['headers'] = headers!.toMap();
+      _authMap['headers'] = headers!.toMap();
     }
-    if (message != null) {
-      _mapSendRequest['message'] = message;
+    return _authMap;
+  }
+
+  @override
+  String toString() {
+    if (headers != null) {
+      return headers!.toJson();
     }
-    if (payload != null) {
-      _mapSendRequest['payload'] = payload;
-    }
-    if (version != null) {
-      _mapSendRequest['version'] = version;
-    }
-    if (subs != null) {
-      _mapSendRequest['subs'] = subs;
-    }
-    return _mapSendRequest;
+    return token!;
   }
 }
 
-class _Request {
-  Function? resolve;
-  Function? reject;
-  Timer? timeout;
-
-  _Request({this.resolve, this.reject, this.timeout});
-}
-
-class _ConnectOptions {
-  bool? reconnect;
-  int? timeout;
-  int? delay;
-  int? maxDelay;
-  double? retries;
-  _Auth? auth;
-
-  _ConnectOptions({
-    this.reconnect,
-    this.timeout,
-    this.delay,
-    this.maxDelay,
-    this.retries,
-    this.auth,
-  });
-
-  factory _ConnectOptions.fromMap(Map<String, dynamic> _json) =>
-      _ConnectOptions(
-        reconnect: _json['reconnect'],
-        timeout: _json['timeout'],
-        delay: _json['delay'],
-        maxDelay: _json['maxDelay'],
-        retries: _json['retries'],
-        auth: _Auth.fromJson(_json['auth']),
-      );
-
-  factory _ConnectOptions.fromJson(String str) =>
-      _ConnectOptions.fromMap(json.decode(str));
-
-  Map<String, dynamic> toMap() => {
-        'reconnect': reconnect,
-        'timeout': timeout,
-        'delay': delay,
-        'maxDelay': maxDelay,
-        'retries': retries,
-        'auth': auth?.toMap(),
-      };
-
-  String toJson() => json.encode(toMap());
-}
-
-class _Settings {
+class _WS {
   int? maxPayload;
-  Iterable<String>? protocols;
-  int? timeout;
-  _Headers? headers;
 
-  _Settings({this.maxPayload, this.protocols, this.timeout, this.headers});
+  _WS({this.maxPayload});
 
-  factory _Settings.fromMap(Map<String, dynamic> json) => _Settings(
-        maxPayload: json['maxPayload'],
-        timeout: json['timeout'],
-        protocols: json['protocols'],
-        headers:
-            json['headers'] != null ? _Headers.fromJson(json['headers']) : null,
+  factory _WS.fromMap(Map<String, dynamic> _json) => _WS(
+        maxPayload: _json['maxPayload'],
       );
-  factory _Settings.fromJson(String str) => _Settings.fromMap(json.decode(str));
-
-  Map<String, dynamic> toMap() => {
-        'maxPayload': maxPayload,
-        'protocols': protocols,
-        'timeout': timeout,
-        'headers': headers == null ? {} : headers!.toMap(),
-      };
-  String toJson() => json.encode(toMap());
-}
-
-class _Message {
-  final String data;
-
-  _Message(this.data);
-
-  factory _Message.fromJson(String str) => _Message(str);
-
-  Map<String, dynamic> toMap() => {'data': data};
-  String toJson() => json.encode(data);
-
-  @override
-  String toString() => toJson();
-}
-
-class _UpdateData {
-  String type;
-  String? id;
-  String? path;
-  _Payload? payload;
-  int? statusCode;
-  String? socket;
-  _Headers? headers;
-  String? message;
-  _HeartbeatTimes? heartbeat;
-
-  _UpdateData({
-    required this.type,
-    this.id,
-    this.path,
-    this.statusCode,
-    this.payload,
-    this.socket,
-    this.headers,
-    this.message,
-    this.heartbeat,
-  });
-
-  factory _UpdateData.fromMap(Map<String, dynamic> _json) => _UpdateData(
-        type: _json['type'],
-        id: _json['id'],
-        path: _json['path'],
-        statusCode: _json['statusCode'],
-        payload: _json['payload'],
-        socket: _json['socket'],
-        headers: _json['headers'],
-        message: _json['message'],
-        heartbeat: _json['heartbeat'],
-        // type: _json['type'],
-      );
-  factory _UpdateData.fromJson(String str) =>
-      _UpdateData.fromMap(json.decode(str));
-
-  Map<String, dynamic> toMap() => {
-        'type': type,
-        'id': id,
-        'path': path,
-        'statusCode': statusCode,
-        'payload': payload,
-        'socket': socket,
-        'headers': headers,
-        'message': message,
-        'heartbeat': heartbeat,
-      };
-  String toJson() => json.encode(toMap());
-}
-
-class _ErrorMessage {
-  final String type;
-  final int? id;
-  final String? statusCode;
-  final _Payload? payload;
-
-  _ErrorMessage(this.type, {this.id, this.statusCode, this.payload});
-
-  factory _ErrorMessage.fromMap(Map<String, dynamic> _json) => _ErrorMessage(
-        _json['type'],
-        id: _json['id'],
-        statusCode: _json['statusCode'],
-        payload: _Payload.fromJson(_json['payload']),
-      );
-  factory _ErrorMessage.fromJson(String str) =>
-      _ErrorMessage.fromMap(json.decode(str));
+  factory _WS.fromJson(String str) => _WS.fromMap(json.decode(str));
 
   Map<String, dynamic> toMap() {
-    final Map<String, dynamic> _errorMessageMap = {'type': type};
-    if (id != null) {
-      _errorMessageMap['id'] = id;
+    final Map<String, dynamic> _wsMap = {};
+    if (maxPayload != null) {
+      _wsMap['maxPayload'] = maxPayload;
     }
-    if (statusCode != null) {
-      _errorMessageMap['statusCode'] = statusCode;
-    }
-    if (payload != null) {
-      _errorMessageMap['payload'] = payload!.toMap();
-    }
-
-    return _errorMessageMap;
+    return _wsMap;
   }
 
   String toJson() => json.encode(toMap());
@@ -1042,41 +810,275 @@ class _ErrorMessage {
   }
 }
 
+abstract class _Connect {
+  int? timeout;
+  int? delay;
+  int? maxDelay;
+  double? retries = double.infinity;
+  bool? reconnect;
+  _Auth? auth;
+
+  _Connect({
+    this.timeout,
+    this.delay,
+    this.maxDelay,
+    this.retries,
+    this.reconnect,
+    this.auth,
+  });
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> _connectOptionsMap = {};
+    if (timeout != null) {
+      _connectOptionsMap['timeout'] = timeout;
+    }
+    if (delay != null) {
+      _connectOptionsMap['delay'] = delay;
+    }
+    if (maxDelay != null) {
+      _connectOptionsMap['maxDelay'] = maxDelay;
+    }
+    if (reconnect != null) {
+      _connectOptionsMap['reconnect'] = reconnect;
+    }
+    if (retries != null) {
+      _connectOptionsMap['retries'] = retries;
+    }
+    if (auth != null) {
+      _connectOptionsMap['auth'] = auth!.toMap();
+    }
+    return _connectOptionsMap;
+  }
+
+  String toJson() => json.encode(toMap());
+
+  @override
+  String toString() => toJson();
+}
+
+class _ConnectOptions extends _Connect {
+  _ConnectOptions({
+    int? timeout,
+    int? delay,
+    int? maxDelay,
+    double? retries,
+    bool? reconnect,
+    _Auth? auth,
+  }) : super(
+          timeout: timeout,
+          delay: delay,
+          maxDelay: maxDelay,
+          retries: retries,
+          reconnect: reconnect,
+          auth: auth,
+        );
+
+  factory _ConnectOptions.fromMap(Map<String, dynamic> _json) =>
+      _ConnectOptions(
+        timeout: _json['timeout'],
+        delay: _json['delay'],
+        maxDelay: _json['maxDelay'],
+        retries: _json['retries'],
+        reconnect: _json['reconnect'],
+        auth: _json['auth'] != null ? _Auth.fromMap(_json['auth']) : null,
+      );
+  factory _ConnectOptions.fromJson(String str) =>
+      _ConnectOptions.fromMap(json.decode(str));
+}
+
+class _Reconnection extends _Connect {
+  _Settings? settings;
+  int? wait;
+
+  _Reconnection({
+    this.wait,
+    int? delay,
+    int? maxDelay,
+    double? retries,
+    bool? reconnect,
+    this.settings,
+  }) : super(
+          timeout: wait,
+          delay: delay,
+          maxDelay: maxDelay,
+          retries: retries,
+          reconnect: reconnect,
+        );
+}
+
+class _Request {
+  String? id;
+  String? version;
+  String type;
+  String? method = 'GET';
+  String? path;
+  String? message;
+  _Payload? payload;
+  _Headers? headers;
+  _Auth? auth;
+  List<String>? subs;
+
+  _Request({
+    required this.type,
+    this.id,
+    this.auth,
+    this.method,
+    this.message,
+    this.headers,
+    this.payload,
+    this.version,
+    this.subs,
+    this.path,
+  });
+
+  factory _Request.fromMap(Map<String, dynamic> _json) => _Request(
+        id: _json['id'],
+        type: _json['type'],
+        method: _json['method'],
+        version: _json['version'],
+        message: _json['message'],
+        subs: _json['subs'],
+        path: _json['path'],
+        headers: _Headers.fromMap(_json['headers'] ?? {}),
+        payload: _Payload.fromMap(_json['payload'] ?? {}),
+        auth: _json['auth'] == null ? null : _Auth.fromMap(_json['auth']),
+      );
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> _requestMap = {'type': type};
+    if (id != null) {
+      _requestMap['id'] = id;
+    }
+    if (method != null) {
+      _requestMap['method'] = method;
+    }
+    if (message != null) {
+      _requestMap['message'] = message;
+    }
+    if (version != null) {
+      _requestMap['version'] = version;
+    }
+    if (subs != null) {
+      _requestMap['subs'] = subs;
+    }
+    if (path != null) {
+      _requestMap['path'] = path;
+    }
+    if (headers != null) {
+      print(headers);
+      _requestMap['headers'] = headers?.toMap();
+    }
+    if (payload != null) {
+      _requestMap['payload'] = payload?.toMap();
+    }
+    if (auth != null) {
+      _requestMap['auth'] = auth?.toMap();
+    }
+
+    return _requestMap;
+  }
+
+  String toJson() => json.encode(toMap());
+
+  @override
+  String toString() => toJson();
+}
+
+class _Response {
+  String data;
+
+  _Response(this.data);
+}
+
 class _Payload {
+  String? content;
+
+  _Payload({this.content});
+
+  factory _Payload.fromMap(Map<String, dynamic> _json) =>
+      _Payload(content: _json['content']);
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> _payloadMap = {};
+    if (content != null) _payloadMap['content'] = content;
+    return _payloadMap;
+  }
+
+  String toJson() => json.encode(content);
+
+  @override
+  String toString() => toJson();
+}
+
+class _HapiError {
+  final String reason;
+  final ErrorTypes type;
+  final int? statusCode;
+  final _ErrorPayload? payload;
+  final _Headers? headers;
+  final String? path;
+
+  _HapiError({
+    required this.reason,
+    required this.type,
+    this.statusCode,
+    this.payload,
+    this.headers,
+    this.path,
+  });
+}
+
+class _Headers {
+  String? authorization;
+  String? cookie;
+
+  _Headers({this.authorization, this.cookie});
+
+  factory _Headers.fromMap(Map<String, dynamic> _json) => _Headers(
+        authorization: _json['authorization'] ?? _json['Authorization'],
+        cookie: _json['cookie'] ?? _json['Cookie'],
+      );
+
+  factory _Headers.fromJson(String str) => _Headers.fromMap(json.decode(str));
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> _headersMap = {};
+    if (authorization != null) {
+      _headersMap['authorization'] = authorization;
+    }
+    if (cookie != null) {
+      _headersMap['cookie'] = cookie;
+    }
+    return _headersMap;
+  }
+
+  String toJson() => json.encode(toMap());
+
+  @override
+  String toString() => toJson();
+}
+
+class _ErrorPayload {
   String? message;
   String? error;
 
-  _Payload({this.message, this.error});
+  _ErrorPayload({this.error, this.message});
 
-  factory _Payload.fromMap(Map<String, dynamic> json) => _Payload(
-        message: json['message'],
-        error: json['error'],
+  factory _ErrorPayload.fromMap(Map<String, dynamic> _json) => _ErrorPayload(
+        message: _json['message'],
+        error: _json['error'],
       );
-  factory _Payload.fromJson(String str) => _Payload.fromMap(json.decode(str));
-
-  Map<String, dynamic> toMap() => {
-        'message': message,
-        'error': error,
-      };
-
-  String toJson() => json.encode(toMap());
 }
 
-class _HeartbeatTimes {
-  int? timeout;
-  int? interval;
-  _HeartbeatTimes({this.timeout, this.interval});
-}
+class _Log {
+  int? code;
+  String? explanation;
+  String? reason;
+  bool? wasClean;
+  bool? willReconnect;
+  bool? wasRequested;
 
-class _Event {
-  final int? code;
-  final String? explanation;
-  final String? reason;
-  final bool? wasClean;
-  final bool? willReconnect;
-  final bool? wasRequested;
-
-  _Event({
+  _Log({
     this.code,
     this.explanation,
     this.reason,
@@ -1085,7 +1087,7 @@ class _Event {
     this.wasRequested,
   });
 
-  factory _Event.fromMap(Map<String, dynamic> _json) => _Event(
+  factory _Log.fromMap(Map<String, dynamic> _json) => _Log(
         code: _json['code'],
         explanation: _json['explanation'],
         reason: _json['reason'],
@@ -1093,18 +1095,16 @@ class _Event {
         willReconnect: _json['willReconnect'],
         wasRequested: _json['wasRequested'],
       );
+}
 
-  factory _Event.fromJson(String str) =>
-      _Event.fromMap(Map<String, dynamic>.from(json.decode(str)));
+class _Record {
+  Future Function()? resolve;
+  Future Function(NesError? error)? reject;
+  Timer? timeout;
 
-  Map<String, dynamic> toMap() => {
-        'code': code,
-        'explanation': explanation,
-        'reason': reason,
-        'wasClean': wasClean,
-        'willReconnect': willReconnect,
-        'wasRequested': wasRequested,
-      };
-
-  String toJson() => json.encode(toMap());
+  _Record({
+    this.resolve,
+    this.reject,
+    this.timeout,
+  });
 }
