@@ -250,8 +250,6 @@ class NesClient {
       authMap = authParsed.cast<String, dynamic>();
     } else if (authParsed is String) {
       authString = authParsed;
-    } else {
-      return false;
     }
 
     _reconnection!.settings?.auth = _Auth(

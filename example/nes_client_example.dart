@@ -11,14 +11,16 @@ void main() async {
       },
     );
 
-    print('connected');
-
     final request = await nesClient.request(path: '/');
     print('request: $request');
 
     await nesClient.subscribe('/items', (update, flags) {
       print('update: ${update.toString()}');
       print('flags: ${flags.toString()}');
+    });
+
+    await nesClient.onUpdate.listen((event) {
+      print('Server says $event');
     });
   } catch (e) {
     rethrow;
