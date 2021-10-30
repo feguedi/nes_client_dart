@@ -28,16 +28,31 @@ class NesClient {
 
   String? id;
 
-  _ignore() {}
+  _ignore([_]) {}
   _nextTick(Function cb) {
     return (err) => Timer(Duration(seconds: 0), cb(err));
   }
 
-  onError(err) => print(err);
-  onConnect() => _ignore();
-  onDisconnect([_]) => _ignore();
-  onHeartbeatTimeout(_) => _ignore();
-  onUpdate(update) => _ignore();
+  final StreamController<List> _onDisconnectController =
+      StreamController<List>();
+  Stream<List> get onDisconnect => _onDisconnectController.stream;
+
+  final StreamController<String?> _onUpdateController =
+      StreamController<String?>();
+  Stream<String?> get onUpdate => _onUpdateController.stream;
+
+  // onError(err) => print(err);
+  final StreamController<NesError> _onErrorController =
+      StreamController<NesError>();
+  Stream<NesError> get onError => _onErrorController.stream;
+
+  final StreamController<String> _onConnectController =
+      StreamController<String>();
+  Stream<String> get onConnect => _onConnectController.stream;
+
+  final StreamController<bool?> _onHeartbeatTimeoutController =
+      StreamController<bool?>();
+  Stream<bool?> get onHeartbeatTimeout => _onHeartbeatTimeoutController.stream;
 
   NesClient(this._url, [Map<String, dynamic>? options]) {
     _settings = options != null ? _Settings.fromMap(options) : _settings;
@@ -112,10 +127,10 @@ class NesClient {
     _ws = IOWebSocketChannel.connect(Uri.parse(_url));
     int timming = 1;
 
-    while (_ws!.innerWebSocket?.readyState != WebSocket.open) {
+    while (_ws!.innerWebSocket == null) {
       await Future.delayed(Duration(seconds: timming));
       timming++;
-      print('connecting');
+      print('creating websocket');
     }
 
     _reconnectionTimer?.cancel();
@@ -129,7 +144,7 @@ class NesClient {
           next = null;
           nextHolder(err);
         } else {
-          onError(err);
+          _onErrorController.add(err ?? NesError('', ErrorTypes.USER));
         }
       } on NesError {
         // print('_connect finalize catch');
@@ -139,7 +154,7 @@ class NesClient {
     }
 
     void reconnect([Map<String, dynamic>? event]) {
-      // print('_connect reconnect event: $event');
+      print('_connect reconnect event: $event');
       try {
         if (_ws!.innerWebSocket?.readyState != WebSocket.open) {
           finalize(NesError(
@@ -163,7 +178,7 @@ class NesClient {
             : null;
         final log = _Log.fromMap(eventMap ?? {});
 
-        onDisconnect([log.willReconnect, log]);
+        _onDisconnectController.add([log.willReconnect, log.toMap()]);
         _reconnect();
       }
     }
@@ -180,54 +195,48 @@ class NesClient {
         ? Timer(Duration(milliseconds: options!.timeout!), timeoutHandler)
         : null;
 
-    void onOpen() {
-      timeout?.cancel();
+    timeout?.cancel();
 
-      _hello(options?.auth).then((value) {
-        // print('_connect onOpen _hello value: $value');
-        onConnect();
-        finalize();
-      }).catchError((err) {
-        // print('_connect onOpen catchError: $err');
-        if (err is Map<String, dynamic> && err['path'] != null) {
-          _subscriptions.remove(err['path']);
-        }
+    _hello(options?.auth).then((value) {
+      // print('_connect onOpen _hello value: $value');
+      _onConnectController.add('Connected');
+      finalize();
+    }).catchError((err) {
+      // print('_connect onOpen catchError: $err');
+      if (err is Map<String, dynamic> && err['path'] != null) {
+        _subscriptions.remove(err['path']);
+      }
 
-        if (err is NesError) {
-          _disconnect(() => _nextTick(finalize)(err), true);
-        }
+      if (err is NesError) {
+        _disconnect(() => _nextTick(finalize)(err), true);
+      }
 
-        throw err;
-      });
-    }
-
-    return Future(() {
-      onOpen();
-
-      return _ws!.stream.listen(
-        (data) {
-          try {
-            // print('_connect _ws.stream.listen: ${data.toString()}');
-            _onMessage(_Response(data));
-          } catch (e) {
-            print(e is _HapiError ? e.reason : e.toString());
-          }
-        },
-        onError: (event) {
-          // print('_connect _ws.stream.listen onError: ${event.toString()}');
-          timeout?.cancel();
-          if (_willReconnect()) {
-            return reconnect(event);
-          }
-
-          _cleanup();
-          final error = NesError('Socket error', ErrorTypes.WS);
-          return finalize(error);
-        },
-        onDone: reconnect,
-        cancelOnError: false,
-      );
+      throw err;
     });
+
+    return _ws!.stream.listen(
+      (data) {
+        try {
+          // print('_connect _ws.stream.listen: ${data.toString()}');
+          _onMessage(_Response(data));
+        } catch (e) {
+          print(e is _HapiError ? e.reason : e.toString());
+        }
+      },
+      onError: (event) {
+        // print('_connect _ws.stream.listen onError: ${event.toString()}');
+        timeout?.cancel();
+        if (_willReconnect()) {
+          return reconnect(event);
+        }
+
+        _cleanup();
+        final error = NesError('Socket error', ErrorTypes.WS);
+        return finalize(error);
+      },
+      onDone: reconnect,
+      cancelOnError: false,
+    );
   }
 
   bool overrideReconnectionAuth(auth) {
@@ -365,7 +374,7 @@ class NesClient {
         false,
         (err) {
           if (err != null) {
-            onError(err);
+            _onErrorController.add(err);
             return _reconnect();
           }
         },
@@ -571,13 +580,14 @@ class NesClient {
 
     if (_packets.length == 1) {
       _packets = [];
-      onError(NesError('Received an incomplete message', ErrorTypes.PROTOCOL));
+      _onErrorController
+          .add(NesError('Received an incomplete message', ErrorTypes.PROTOCOL));
     }
 
     try {
       update = json.decode(data);
     } catch (e) {
-      return onError(NesError(e, ErrorTypes.PROTOCOL));
+      return _onErrorController.add(NesError(e, ErrorTypes.PROTOCOL));
     }
 
     _HapiError? error;
@@ -603,7 +613,7 @@ class NesClient {
         return _send(_Request(type: 'ping'), false).catchError(_ignore);
 
       case 'update':
-        return onUpdate(update['message']);
+        return _onUpdateController.add(update['message']);
 
       case 'pub':
       case 'revoke':
@@ -629,7 +639,7 @@ class NesClient {
 
     final _Record? request = _requests[update['id']];
     if (request == null) {
-      return onError(NesError(
+      return _onErrorController.add(NesError(
           'Received response for unknown request', ErrorTypes.PROTOCOL));
     }
 
@@ -684,7 +694,7 @@ class NesClient {
       reason: 'Received invalid response',
       type: ErrorTypes.PROTOCOL,
     ));
-    return onError(NesError(
+    return _onErrorController.add(NesError(
       'Received unknown response type: ${update['type']}',
       ErrorTypes.PROTOCOL,
     ));
@@ -698,15 +708,19 @@ class NesClient {
     _heartbeat?.cancel();
 
     _heartbeat = Timer(Duration(milliseconds: _heartbeatTimeout!), () {
-      onError(NesError(
+      _onErrorController.add(NesError(
           'Disconnecting due to heartbeat timeout', ErrorTypes.TIMEOUT));
-      onHeartbeatTimeout(_willReconnect());
+      _onHeartbeatTimeoutController.add(_willReconnect());
       _ws!.sink.close();
     });
   }
 
   bool _willReconnect() {
     return _reconnection != null && _reconnection!.retries! >= 1;
+  }
+
+  Stream<int?> status() async* {
+    yield _ws?.innerWebSocket?.readyState;
   }
 
   IOWebSocketChannel? get channel => _ws;
@@ -1100,6 +1114,34 @@ class _Log {
         willReconnect: _json['willReconnect'],
         wasRequested: _json['wasRequested'],
       );
+
+  Map<String, dynamic> toMap() {
+    final Map<String, dynamic> logMap = {};
+    if (code != null) {
+      logMap['code'] = code;
+    }
+    if (explanation != null) {
+      logMap['explanation'] = explanation;
+    }
+    if (reason != null) {
+      logMap['reason'] = reason;
+    }
+    if (wasClean != null) {
+      logMap['wasClean'] = wasClean;
+    }
+    if (willReconnect != null) {
+      logMap['willReconnect'] = willReconnect;
+    }
+    if (wasRequested != null) {
+      logMap['wasRequested'] = wasRequested;
+    }
+    return logMap;
+  }
+
+  String toJson() => json.encode(toMap());
+
+  @override
+  String toString() => toJson();
 }
 
 class _Record {
