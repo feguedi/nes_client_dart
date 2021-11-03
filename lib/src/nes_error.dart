@@ -57,26 +57,30 @@ class _NesError extends Error {
 
 class NesError {
   final ErrorTypes errorType;
-  final _NesError _nesError = _NesError();
+  String? _errorTypeString;
+  late _NesError? _nesError;
+  late _NesException? _nesException;
 
   NesError(err, this.errorType) {
     if (err is String) {
-      final String errorTypeString =
-          errorType.toString().replaceAll('ErrorTypes.', '');
-      print(_throwException('$errorTypeString: $err'));
+      _errorTypeString =
+          '${errorType.toString().replaceAll('ErrorTypes.', '')}: $err';
+      _nesException = _NesException(_errorTypeString!);
     } else if (err is Object) {
-      _nesError.type = errorType;
-      _nesError.isNes = true;
-    }
-
-    try {
-      throw _nesError;
-    } catch (e) {
-      rethrow;
+      _nesError = _NesError();
+      _nesError!.type = errorType;
+      _nesError!.isNes = true;
     }
   }
 
-  _throwException(String message) {
-    throw _NesException(message);
+  @override
+  String toString() => 'NesError: ${_errorTypeString ?? _nesError.toString()}';
+
+  throwNesError() {
+    if (_nesError != null) {
+      throw _nesError!;
+    } else if (_nesException != null) {
+      throw _nesException!;
+    }
   }
 }
